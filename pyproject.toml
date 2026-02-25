@@ -1,0 +1,12 @@
+[project]
+name = "vaci"
+version = "0.0.1"
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2", "cryptography>=46"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[project.scripts]
+vaci = "vaci.cli:main"
