@@ -125,13 +125,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     import uuid
     import hashlib
 
-    run_id = args.run_id or uuid.uuid4().hex
-    call_id = args.call_id or uuid.uuid4().hex
-    policy_id = args.policy_id
-
-    if not policy_id:
-        print("FAIL: --policy-id is required (or set VACI_POLICY_ID)", file=sys.stderr)
-        return 2
+    run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
+    call_id = getattr(args, "call_id", None) or uuid.uuid4().hex
+    policy_id = getattr(args, "policy_id", None) or os.environ.get("VACI_POLICY_ID") or "dev"
 
     # Commit 2: persistent gateway by default
     if getattr(args, "ephemeral", False):

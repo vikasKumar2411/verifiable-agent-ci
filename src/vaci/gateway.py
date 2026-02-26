@@ -161,9 +161,9 @@ class LocalGateway:
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         timeout_s: Optional[float] = None,
-        run_id: str,
-        policy_id: str,
-        call_id: str,
+        run_id: Optional[str] = None,
+        policy_id: Optional[str] = None,
+        call_id: Optional[str] = None,
     ) -> Receipt:
         if isinstance(command, str):
             command_list = shlex.split(command)
@@ -191,6 +191,12 @@ class LocalGateway:
         stderr = p.stderr or b""
         stdout_h = _sha256_bytes(stdout)
         stderr_h = _sha256_bytes(stderr)
+
+        import uuid
+
+        run_id = run_id or uuid.uuid4().hex
+        call_id = call_id or uuid.uuid4().hex
+        policy_id = policy_id or "dev"
 
         payload = {
             "run_id": run_id,
