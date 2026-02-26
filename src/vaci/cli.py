@@ -369,11 +369,24 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
         rp = _abs_from_manifest(entry["receipt_path"])
         pp = _abs_from_manifest(entry["pubkey_path"])
 
-        if _sha256_file(rp) != entry.get("receipt_sha256"):
-            print(f"FAIL: receipt sha256 mismatch for {rp}", file=sys.stderr)
+        # receipt sha
+        actual_receipt = _sha256_file(rp)
+        expected_receipt = entry.get("receipt_sha256")
+        if actual_receipt != expected_receipt:
+            print("FAIL: receipt sha256 mismatch", file=sys.stderr)
+            print(f"  file: {rp}", file=sys.stderr)
+            print(f"  expected: {expected_receipt}", file=sys.stderr)
+            print(f"  got: {actual_receipt}", file=sys.stderr)
             return 2
-        if _sha256_file(pp) != entry.get("pubkey_sha256"):
-            print(f"FAIL: pubkey sha256 mismatch for {pp}", file=sys.stderr)
+
+        # pubkey sha
+        actual_pubkey = _sha256_file(pp)
+        expected_pubkey = entry.get("pubkey_sha256")
+        if actual_pubkey != expected_pubkey:
+            print("FAIL: pubkey sha256 mismatch", file=sys.stderr)
+            print(f"  file: {pp}", file=sys.stderr)
+            print(f"  expected: {expected_pubkey}", file=sys.stderr)
+            print(f"  got: {actual_pubkey}", file=sys.stderr)
             return 2
 
         # Load pubkey + verify receipt cryptographically
@@ -494,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Add a signer key_id to trusted_keys.json using a public_key_b64.json file",
     )
     trust_add.add_argument("--pubkey", required=True, help="Path to public_key_b64.json")
-    trust_add.add_argument("--trust", default="trusted_keys.json", help="Trust store path (default: trusted_keys.json)")
+    trust_add.add_argument("--trust", default=".vaci/trusted_keys.json", help="Trust store path (default: trusted_keys.json)")
     trust_add.set_defaults(fn=cmd_trust_add)
 
     runp = sp.add_parser("run", help="Run a command and emit signed receipt artifacts")
@@ -520,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     verp.add_argument("--pubkey", default=".vaci/public_key_b64.json")
     verp.add_argument(
         "--trust",
-        default="trusted_keys.json",
+        default=".vaci/trusted_keys.json",
         help="Path to trusted signer key allowlist (default: trusted_keys.json)",
     )
     verp.set_defaults(fn=cmd_verify)
@@ -529,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
     mp.add_argument("--manifest", default=".vaci/run_manifest.json")
     mp.add_argument(
         "--trust",
-        default="trusted_keys.json",
+        default=".vaci/trusted_keys.json",
         help="Path to trusted signer key allowlist (default: trusted_keys.json)",
     )
     mp.add_argument("--pubkey", default=None, help="Optional override pubkey file (otherwise uses manifest receipts[0])")
