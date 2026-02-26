@@ -123,6 +123,16 @@ def cmd_trust_add(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     import base64 as _b64
     from cryptography.hazmat.primitives import serialization
+    import uuid
+    import hashlib
+
+    run_id = args.run_id or uuid.uuid4().hex
+    call_id = args.call_id or uuid.uuid4().hex
+    policy_id = args.policy_id
+
+    if not policy_id:
+        print("FAIL: --policy-id is required (or set VACI_POLICY_ID)", file=sys.stderr)
+        return 2
 
     # Commit 2: persistent gateway by default
     if getattr(args, "ephemeral", False):
@@ -136,7 +146,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("Hint: run: vaci keygen --out .vaci_keys/gateway_ed25519.key", file=sys.stderr)
             return 2
 
-    receipt = gw.run(args.command, cwd=args.cwd)
+
+    receipt = gw.run(
+    args.command,
+    cwd=args.cwd,
+    run_id=run_id,
+    policy_id=policy_id,
+    call_id=call_id,
+)
 
     pk = gw.public_key
     # Support both "raw bytes" or "cryptography key object"
@@ -149,11 +166,48 @@ def cmd_run(args: argparse.Namespace) -> int:
         pubkey_bytes = pk
 
     out_dir = Path(args.out_dir)
+
+    pubkey_path = out_dir / "public_key_b64.json"
     _write_json(
-        out_dir / "public_key_b64.json",
+        pubkey_path,
         {"pubkey_b64": _b64.urlsafe_b64encode(pubkey_bytes).decode("ascii").rstrip("=")},
     )
-    _write_json(out_dir / "receipt.json", receipt.to_dict())
+
+    receipt_path = out_dir / "receipt.json"
+    _write_json(receipt_path, receipt.to_dict())
+
+    # ---- NEW: run manifest ----
+    import subprocess
+
+    def _sha256_file(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    try:
+        git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        git_sha = None
+
+    manifest = {
+        "run_id": run_id,
+        "policy_id": policy_id,
+        "git_sha": git_sha,
+        "receipts": [
+            {
+                "call_id": call_id,
+                "receipt_path": str(receipt_path),
+                "receipt_sha256": _sha256_file(receipt_path),
+                "pubkey_path": str(pubkey_path),
+                "pubkey_sha256": _sha256_file(pubkey_path),
+            }
+        ],
+    }
+    _write_json(out_dir / "run_manifest.json", manifest)
+    # --------------------------
+
     return 0
 
 
@@ -172,6 +226,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     sig = rj["signature"]
 
     receipt = Receipt(
+        run_id=rj["run_id"],
+        policy_id=rj["policy_id"],
+        call_id=rj["call_id"],
         command=rj["command"],
         cwd=rj["cwd"],
         started_at_ms=rj["started_at_ms"],
@@ -183,7 +240,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
         stderr_sha256_b64=rj["stderr_sha256_b64"],
         signature=__import__("vaci.schema", fromlist=["Signature"]).Signature(**sig),
     )
-
     ok = verify_receipt(pubkey, receipt)
     if not ok:
         print("FAIL: receipt verification failed", file=sys.stderr)
@@ -225,9 +281,18 @@ def main(argv: list[str] | None = None) -> int:
     runp = sp.add_parser("run", help="Run a command and emit signed receipt artifacts")
     runp.add_argument("--out-dir", default=".vaci", help="Directory to write receipt artifacts")
     runp.add_argument("--cwd", default=None, help="Working directory")
-    # Commit 2: persistent key usage
     runp.add_argument("--keyfile", default=".vaci_keys/gateway_ed25519.key", help="Gateway private keyfile")
     runp.add_argument("--ephemeral", action="store_true", help="Use ephemeral key (dev/tests)")
+
+    # NEW: ids
+    runp.add_argument("--run-id", default=None, help="Run id (default: auto-generated)")
+    runp.add_argument(
+        "--policy-id",
+        default=os.environ.get("VACI_POLICY_ID"),
+        help="Policy id (default: env VACI_POLICY_ID)",
+    )
+    runp.add_argument("--call-id", default=None, help="Call id (default: auto-generated per invocation)")
+
     runp.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute (use: vaci run -- <cmd>)")
     runp.set_defaults(fn=cmd_run)
 

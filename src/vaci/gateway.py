@@ -27,6 +27,9 @@ class Receipt:
     """
     A signed, verifiable record that a command actually executed.
     """
+    run_id: str
+    policy_id: str
+    call_id: str
     command: List[str]
     cwd: str
     started_at_ms: int
@@ -40,6 +43,9 @@ class Receipt:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "run_id": self.run_id,
+            "policy_id": self.policy_id,
+            "call_id": self.call_id,
             "command": self.command,
             "cwd": self.cwd,
             "started_at_ms": self.started_at_ms,
@@ -106,6 +112,9 @@ class LocalGateway:
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         timeout_s: Optional[float] = None,
+        run_id: str,
+        policy_id: str,
+        call_id: str,
     ) -> Receipt:
         if isinstance(command, str):
             command_list = shlex.split(command)
@@ -135,8 +144,9 @@ class LocalGateway:
         stderr_h = _sha256_bytes(stderr)
 
         payload = {
-            # IMPORTANT: payload includes hashes, not just raw output,
-            # so consumers can verify integrity cheaply.
+            "run_id": run_id,
+            "policy_id": policy_id,
+            "call_id": call_id,
             "command": command_list,
             "cwd": cwd,
             "started_at_ms": started,
@@ -153,6 +163,9 @@ class LocalGateway:
             sig = Signature(**{**sig.model_dump(), "key_id": self._key_id})
 
         return Receipt(
+            run_id=run_id,
+            policy_id=policy_id,
+            call_id=call_id,
             command=command_list,
             cwd=cwd,
             started_at_ms=started,
@@ -182,6 +195,9 @@ def verify_receipt(pubkey: bytes, r: Receipt) -> bool:
 
     # 2) verify signature over canonical payload (same as gateway signs)
     payload = {
+        "run_id": r.run_id,
+        "policy_id": r.policy_id,
+        "call_id": r.call_id,
         "command": r.command,
         "cwd": r.cwd,
         "started_at_ms": r.started_at_ms,
