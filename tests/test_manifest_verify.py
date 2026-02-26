@@ -35,33 +35,36 @@ def test_verify_manifest_happy_path(tmp_path: Path):
     # 2) trust add
     p = _run(_python_cli_args() + ["trust", "add", "--pubkey", ".vaci/public_key_b64.json"], cwd=root)
     assert p.returncode == 0, p.stderr + "\n" + p.stdout
-    assert "OK: trusted key_id" in p.stdout
+
+    out = (p.stdout or "") + (p.stderr or "")
+    assert "OK: trusted key_id" in out
 
     # 3) verify-manifest
     p = _run(_python_cli_args() + ["verify-manifest", "--manifest", ".vaci/run_manifest.json"], cwd=root)
     assert p.returncode == 0, p.stderr + "\n" + p.stdout
-    assert "OK: manifest verified" in p.stdout
+
+    out = (p.stdout or "") + (p.stderr or "")
+    assert "OK: manifest verified" in out
 
 
 def test_verify_manifest_fails_if_untrusted(tmp_path: Path):
     root = Path.cwd()
 
-    # Clean trust store if your implementation supports it; otherwise delete the trust file if known.
-    # If your trust store lives under .vaci/, wipe it to ensure untrusted state.
-    # Adjust filenames below if your project uses a different trust file name.
-    for candidate in [Path(".vaci/trusted_keys.json"), Path(".vaci/trust_store.json")]:
-        f = root / candidate
-        if f.exists():
-            f.unlink()
-
     p = _run(_python_cli_args() + ["run", "--policy-id", "demo", "--", "echo", "hello"], cwd=root)
     assert p.returncode == 0, p.stderr + "\n" + p.stdout
 
-    p = _run(_python_cli_args() + ["verify-manifest", "--manifest", ".vaci/run_manifest.json"], cwd=root)
-    assert p.returncode == 2, p.stderr + "\n" + p.stdout
-    # One of these should appear depending on your message text:
-    assert ("untrusted" in (p.stdout + p.stderr).lower()) or ("trust add" in (p.stdout + p.stderr).lower())
+    # empty trust store -> must fail
+    trust_path = tmp_path / "trusted_keys.json"
+    trust_path.write_text(json.dumps({"trusted_key_ids": []}, indent=2))
 
+    p = _run(
+        _python_cli_args()
+        + ["verify-manifest", "--manifest", ".vaci/run_manifest.json", "--trust", str(trust_path)],
+        cwd=root,
+    )
+    out = (p.stdout or "") + (p.stderr or "")
+    assert p.returncode == 2, out
+    assert ("untrusted" in out.lower()) or ("trust add" in out.lower())
 
 def test_verify_manifest_fails_on_receipt_tamper(tmp_path: Path):
     root = Path.cwd()

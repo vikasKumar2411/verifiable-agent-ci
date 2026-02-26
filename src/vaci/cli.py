@@ -319,12 +319,31 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
         print("FAIL: manifest signature verification failed", file=sys.stderr)
         return 2
 
-    # -------- trust root check for signer --------
+    # -------- trust root check for signer (enforce allowlist here) --------
     signer_key_id = hashlib.sha256(pubkey_raw).hexdigest()
-    try:
-        assert_trusted_signer(key_id=signer_key_id, trust_path=args.trust)
-    except TrustError as e:
-        print(f"FAIL: trust check failed: {e}", file=sys.stderr)
+
+    trust_path = Path(args.trust).expanduser()
+    if not trust_path.is_absolute():
+        # interpret relative trust paths relative to current working dir
+        trust_path = (Path.cwd() / trust_path).resolve()
+
+    if trust_path.exists():
+        try:
+            tj = _read_json(trust_path)
+        except Exception as e:
+            print(f"FAIL: could not read trust store {trust_path}: {e}", file=sys.stderr)
+            return 2
+    else:
+        tj = {"trusted_key_ids": []}
+
+    ids = tj.get("trusted_key_ids")
+    if not isinstance(ids, list) or not all(isinstance(x, str) for x in ids):
+        print('FAIL: trust store must contain {"trusted_key_ids": [..strings..]}', file=sys.stderr)
+        return 2
+
+    if signer_key_id not in set(ids):
+        print(f"FAIL: untrusted signer key_id {signer_key_id}", file=sys.stderr)
+        print(f"Hint: python -m vaci.cli trust add --pubkey .vaci/public_key_b64.json --trust {trust_path}", file=sys.stderr)
         return 2
 
     # -------- verify referenced files + receipts --------
