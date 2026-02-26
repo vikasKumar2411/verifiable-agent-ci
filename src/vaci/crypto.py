@@ -36,8 +36,15 @@ def canonical_json_bytes(obj: Any) -> bytes:
     - sorted keys
     - no whitespace
     - UTF-8
+    - disallow NaN/Infinity (not portable JSON)
     """
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def sha256_bytes(data: bytes) -> Tuple[str, int]:
@@ -134,12 +141,16 @@ def sign_obj_ed25519(priv: Ed25519PrivateKey, obj: Any) -> Tuple[HashRef, Signat
 def verify_obj_ed25519(pub: Ed25519PublicKey, obj: Any, signature: Signature) -> bool:
     if signature.alg != "ed25519":
         return False
-    href, payload = hashref_sha256_from_obj(obj)
+
+    pub = _pubkey_obj(pub)
+
+    _, payload = hashref_sha256_from_obj(obj)
+
     # Optional consistency check: key_id should match provided pubkey
     if signature.key_id != public_key_id(pub):
         return False
-    return verify_payload_bytes_ed25519(pub, payload, signature.sig_b64)
 
+    return verify_payload_bytes_ed25519(pub, payload, signature.sig_b64)
 
 # ----------------------------
 # Convenience: sign "receipt payload"

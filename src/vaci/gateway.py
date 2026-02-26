@@ -22,17 +22,22 @@ def _sha256_bytes(data: bytes) -> bytes:
     import hashlib
     return hashlib.sha256(data).digest()
 
-
 def sign_manifest(privkey: bytes, manifest_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Returns a manifest object with:
-      - manifest_hash (HashRef)
-      - signature (Signature)
-    The signature is over the *payload only* (no signature fields included).
+    Variant-B standard:
+      - manifest_hash is sha256(canonical_json(payload))
+      - signature is over the same payload bytes
+      - payload MUST NOT include manifest_hash/signature (we strip defensively)
     """
-    href, sig = sign_obj_ed25519(privkey, manifest_payload)
+    # Defensive: ensure we never sign a payload that already includes signature fields
+    payload = dict(manifest_payload)
+    payload.pop("signature", None)
+    payload.pop("manifest_hash", None)
+
+    href, sig = sign_obj_ed25519(privkey, payload)
+
     return {
-        **manifest_payload,
+        **payload,
         "manifest_hash": href.model_dump(),
         "signature": sig.model_dump(),
     }
@@ -40,33 +45,36 @@ def sign_manifest(privkey: bytes, manifest_payload: Dict[str, Any]) -> Dict[str,
 
 def verify_manifest(pubkey: bytes, manifest_json: Dict[str, Any]) -> bool:
     """
-    Verify manifest signature (and optional hash consistency).
+    Variant-B verification only:
+      - signature must verify over payload WITHOUT {signature, manifest_hash}
+      - manifest_hash must match that same payload
     """
     sigj = manifest_json.get("signature")
-    if not isinstance(sigj, dict):
+    mh = manifest_json.get("manifest_hash")
+
+    if not isinstance(sigj, dict) or not isinstance(mh, dict):
         return False
 
-    # payload = manifest without signature fields
     payload = dict(manifest_json)
     payload.pop("signature", None)
     payload.pop("manifest_hash", None)
 
     sig = Signature(**sigj)
 
-    ok = verify_obj_ed25519(pubkey, payload, sig)
-    if not ok:
+    # 1) Verify signature over Variant-B payload
+    if not verify_obj_ed25519(pubkey, payload, sig):
         return False
 
-    # optional: if manifest_hash exists, ensure it matches payload
-    mh = manifest_json.get("manifest_hash")
-    if isinstance(mh, dict):
-        from vaci.crypto import hashref_sha256_from_obj
-        href, _ = hashref_sha256_from_obj(payload)
-        if mh.get("alg") != href.alg or mh.get("hex") != href.hex or mh.get("size_bytes") != href.size_bytes:
-            return False
+    # 2) Verify manifest_hash matches Variant-B payload
+    from vaci.crypto import hashref_sha256_from_obj
+    href, _ = hashref_sha256_from_obj(payload)
 
-    return True
-
+    return (
+        mh.get("alg") == href.alg
+        and mh.get("hex") == href.hex
+        and mh.get("size_bytes") == href.size_bytes
+    )
+    
 @dataclass(frozen=True)
 class Receipt:
     """

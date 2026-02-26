@@ -1,0 +1,43 @@
+{
+  "key": {
+    "format": "raw",
+    "key_id": "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "kty": "Ed25519",
+    "privkey_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "pubkey_b64": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+  },
+  "name": "golden_manifest_v1",
+  "signed_manifest": {
+    "created_at_ms": 1700000000000,
+    "finalized": false,
+    "git_sha": "dc231bc0818926b869760c911e370fc69383e2db",
+    "manifest_hash": {
+      "alg": "sha256",
+      "hex": "cf965baf2f19b16cf7ee29172e8fd34c0ca23e115491da36dd035b8c67eb888a",
+      "size_bytes": 767
+    },
+    "policy_id": "demo",
+    "policy_sha256": "ba56fa7d895f7b33aa53edf6ad4ea858b1a725915f7c1001cf5db4061af6b836",
+    "receipts": [
+      {
+        "call_id": "call_001",
+        "created_at_ms": 1700000001111,
+        "entry_hash": "ffe2ab50820649c17f4539e865b25887f6f562b8174142ffd569d47652d3a1a7",
+        "policy_sha256": "ba56fa7d895f7b33aa53edf6ad4ea858b1a725915f7c1001cf5db4061af6b836",
+        "prev_entry_hash": null,
+        "pubkey_path": "public_key_call_001.json",
+        "pubkey_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "receipt_path": "receipt_call_001.json",
+        "receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "run_id": "run_001",
+    "signature": {
+      "alg": "ed25519",
+      "key_id": "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+      "sig_b64": "LwSLnb3XR5xORaFsa0Z8/jGg2oT9+r1u4wS2S5p/4Bea5lk2ZNrllBnfVHdaSuyD3RgdKh7Q8eCjdL+hYiwQCw=="
+    },
+    "updated_at_ms": 1700000001234,
+    "version": "v1"
+  }
+}

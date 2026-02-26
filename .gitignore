@@ -7,3 +7,7 @@ __pycache__/
 .vaci_keys/
 .vaci/
 *.key
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

@@ -506,29 +506,18 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     pubkey_raw = _b64.urlsafe_b64decode(pub_b64 + "==")
     pubkey = ed25519.Ed25519PublicKey.from_public_bytes(pubkey_raw)
 
-    # -------- reconstruct payload variants --------
-    # Variant A: payload excludes only "signature" (includes manifest_hash)
-    payload_a = dict(mj)
-    payload_a.pop("signature", None)
-
-    # Variant B: payload excludes "signature" and "manifest_hash"
+    # -------- Variant-B only --------
     payload_b = dict(mj)
     payload_b.pop("signature", None)
     payload_b.pop("manifest_hash", None)
 
-    href_a, _ = hashref_sha256_from_obj(payload_a)
     href_b, _ = hashref_sha256_from_obj(payload_b)
 
-    def _href_matches(href) -> bool:
-        return href.hex == declared_hex and href.size_bytes == declared_size
-
-    if _href_matches(href_a):
-        payload_for_sig = payload_a
-    elif _href_matches(href_b):
-        payload_for_sig = payload_b
-    else:
-        print("FAIL: manifest_hash mismatch (tampered manifest)", file=sys.stderr)
+    if not (href_b.hex == declared_hex and href_b.size_bytes == declared_size):
+        print("FAIL: manifest_hash mismatch (expected Variant-B)", file=sys.stderr)
         return 2
+
+    payload_for_sig = payload_b
 
     # -------- signature check --------
     try:
