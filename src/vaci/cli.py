@@ -25,6 +25,96 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha256_obj(obj: Any) -> str:
+    """
+    Hash a JSON-serializable object deterministically (canonical-ish JSON).
+    """
+    b = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(b).hexdigest()
+
+
+def _compute_policy_sha256(policy_path: str | None) -> str | None:
+    if not policy_path:
+        return None
+    p = Path(policy_path).expanduser()
+    if not p.is_absolute():
+        p = (Path.cwd() / p).resolve()
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+    return _sha256_file(p)
+
+def _write_gateway_keyfile(path: Path, gw: LocalGateway) -> None:
+    """
+    Persist a gateway keyfile in the same format as cmd_keygen produces,
+    so LocalGateway.from_keyfile() can reload it.
+    """
+    import base64 as _b64
+    from cryptography.hazmat.primitives import serialization
+
+    priv = getattr(gw, "private_key_bytes", None)
+    pub = getattr(gw, "public_key", None)
+
+    # Some implementations may expose these as callables/properties
+    if callable(priv):
+        priv = priv()
+    if callable(pub):
+        pub = pub()
+
+    # ---- coerce private key to raw bytes ----
+    if hasattr(priv, "private_bytes"):
+        priv = priv.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+    elif isinstance(priv, str):
+        # allow urlsafe b64 (no padding) just in case
+        priv = _b64.urlsafe_b64decode(priv + "==")
+
+    # ---- coerce public key to raw bytes ----
+    if hasattr(pub, "public_bytes"):
+        pub = pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    elif isinstance(pub, str):
+        pub = _b64.urlsafe_b64decode(pub  + "==")
+
+    if not isinstance(priv, (bytes, bytearray)) or not isinstance(pub, (bytes, bytearray)):
+        raise TypeError("LocalGateway must expose raw private/public key bytes")
+
+    priv_b = bytes(priv)
+    pub_b = bytes(pub)
+    key_id = hashlib.sha256(pub_b).hexdigest()
+
+    obj = {
+        "kty": "Ed25519",
+        "format": "raw",
+        "privkey_b64": _b64.urlsafe_b64encode(priv_b).decode("ascii").rstrip("="),
+        "pubkey_b64": _b64.urlsafe_b64encode(pub_b).decode("ascii").rstrip("="),
+        "key_id": key_id,
+    }
+    _write_json(path, obj)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+def _entry_hash(entry: Dict[str, Any]) -> str:
+    """
+    Hash an entry excluding its own entry_hash.
+    """
+    payload = {k: v for k, v in entry.items() if k != "entry_hash"}
+    return _sha256_obj(payload)
+
 
 def _manifest_payload_from_signed(mj: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -172,15 +262,30 @@ def cmd_run(args: argparse.Namespace) -> int:
     import base64 as _b64
     from cryptography.hazmat.primitives import serialization
     import uuid
-    import hashlib
 
-    run_id = getattr(args, "run_id", None) or uuid.uuid4().hex
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = getattr(args, "run_id", None) or os.environ.get("VACI_RUN_ID") or uuid.uuid4().hex
     call_id = getattr(args, "call_id", None) or uuid.uuid4().hex
     policy_id = getattr(args, "policy_id", None) or os.environ.get("VACI_POLICY_ID") or "dev"
+    policy_path = getattr(args, "policy_path", None) or os.environ.get("VACI_POLICY_PATH")
+    try:
+        policy_sha256 = _compute_policy_sha256(policy_path)
+    except FileNotFoundError as e:
+        print(f"FAIL: policy file not found: {e}", file=sys.stderr)
+        return 2
 
     # Commit 2: persistent gateway by default
     if getattr(args, "ephemeral", False):
-        gw = LocalGateway.ephemeral()
+        # IMPORTANT: keep ephemeral signer stable across a session (same out_dir),
+        # otherwise manifest signature will flip every run and verification fails.
+        ephem_keyfile = out_dir / "ephemeral_gateway_ed25519.key"
+        if ephem_keyfile.exists():
+            gw = LocalGateway.from_keyfile(str(ephem_keyfile))
+        else:
+            gw = LocalGateway.ephemeral()
+            _write_gateway_keyfile(ephem_keyfile, gw)
     else:
         try:
             keyfile = getattr(args, "keyfile", ".vaci_keys/gateway_ed25519.key")
@@ -191,12 +296,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
 
     receipt = gw.run(
-    args.command,
-    cwd=args.cwd,
-    run_id=run_id,
-    policy_id=policy_id,
-    call_id=call_id,
-)
+        args.command,
+        cwd=args.cwd,
+        run_id=run_id,
+        policy_id=policy_id,
+        call_id=call_id,
+    )
 
     pk = gw.public_key
     # Support both "raw bytes" or "cryptography key object"
@@ -207,10 +312,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     else:
         pubkey_bytes = pk
-
-    out_dir = Path(args.out_dir)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Per-call artifacts (session mode)
     receipt_name = f"receipt_{call_id}.json"
@@ -234,17 +335,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     manifest_path = out_dir / "run_manifest.json"
 
-    def _sha256_file(path: Path) -> str:
-        h = hashlib.sha256()
-        with path.open("rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-
     try:
         git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     except Exception:
         git_sha = None
+
+
+    # Safety: if manifest exists, require explicit run-id (or env VACI_RUN_ID) to append.
+    if manifest_path.exists() and not (getattr(args, "run_id", None) or os.environ.get("VACI_RUN_ID")):
+        print("FAIL: manifest exists; refusing to append without explicit --run-id (or env VACI_RUN_ID)", file=sys.stderr)
+        return 2
 
     entry = {
         "call_id": call_id,
@@ -253,6 +353,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "receipt_sha256": _sha256_file(receipt_path),
         "pubkey_path": pubkey_path.name,
         "pubkey_sha256": _sha256_file(pubkey_path),
+        "policy_sha256": policy_sha256,
     }
 
     if manifest_path.exists():
@@ -271,6 +372,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"FAIL: policy_id mismatch vs existing manifest ({payload.get('policy_id')} != {policy_id})", file=sys.stderr)
             return 2
 
+        if payload.get("policy_sha256") != policy_sha256:
+            print("FAIL: policy_sha256 mismatch vs existing manifest", file=sys.stderr)
+            print(f"  expected: {payload.get('policy_sha256')}", file=sys.stderr)
+            print(f"  got: {policy_sha256}", file=sys.stderr)
+            return 2
+
         receipts = payload.get("receipts")
         if not isinstance(receipts, list):
             print("FAIL: manifest payload receipts must be a list", file=sys.stderr)
@@ -280,13 +387,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         payload.setdefault("created_at_ms", _now_ms())
         payload["updated_at_ms"] = _now_ms()
         payload.setdefault("finalized", False)
+        payload.setdefault("policy_sha256", policy_sha256)
 
         # preserve git_sha from first creation unless missing
         if payload.get("git_sha") is None:
             payload["git_sha"] = git_sha
 
+        # chain hashes
+        prev = receipts[-1].get("entry_hash") if receipts else None
+        entry["prev_entry_hash"] = prev
+        entry["entry_hash"] = _entry_hash(entry)
+
         receipts.append(entry)
     else:
+        entry["prev_entry_hash"] = None
+        entry["entry_hash"] = _entry_hash(entry)
         payload = {
             "run_id": run_id,
             "policy_id": policy_id,
@@ -294,6 +409,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "created_at_ms": _now_ms(),
             "updated_at_ms": _now_ms(),
             "finalized": False,
+            "policy_sha256": policy_sha256,
             "receipts": [entry],
         }
 
@@ -321,6 +437,15 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
 
     manifest_path = Path(args.manifest)
     mj = _read_json(manifest_path)
+
+    require_finalized = bool(getattr(args, "require_finalized", False))
+    policy_path = getattr(args, "policy_path", None) or os.environ.get("VACI_POLICY_PATH")
+    try:
+        policy_sha256_expected = _compute_policy_sha256(policy_path) if policy_path else None
+    except FileNotFoundError as e:
+        print(f"FAIL: policy file not found: {e}", file=sys.stderr)
+        return 2
+
 
     # -------- helpers --------
     def _sha256_file(path: Path) -> str:
@@ -446,12 +571,46 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     # -------- verify referenced files + receipts --------
     run_id = mj.get("run_id")
     policy_id = mj.get("policy_id")
+
+    manifest_policy_sha256 = mj.get("policy_sha256")
+
+    if policy_sha256_expected is not None and manifest_policy_sha256 != policy_sha256_expected:
+        print("FAIL: manifest policy_sha256 does not match provided policy-path", file=sys.stderr)
+        print(f"  expected: {policy_sha256_expected}", file=sys.stderr)
+        print(f"  got: {manifest_policy_sha256}", file=sys.stderr)
+        return 2
+
+    if require_finalized and mj.get("finalized") is not True:
+        print("FAIL: manifest is not finalized", file=sys.stderr)
+        print("Hint: run: python -m vaci.cli finalize --manifest <path> --keyfile <key>", file=sys.stderr)
+        return 2
+
     if run_id is not None and not isinstance(run_id, str):
         print("FAIL: manifest run_id must be a string if present", file=sys.stderr)
         return 2
     if policy_id is not None and not isinstance(policy_id, str):
         print("FAIL: manifest policy_id must be a string if present", file=sys.stderr)
         return 2
+    
+    # -------- verify receipt entry chain (reorder/delete detection) --------
+    prev = None
+    for i, e in enumerate(receipts):
+        if not isinstance(e, dict):
+            print(f"FAIL: receipts[{i}] is not an object", file=sys.stderr)
+            return 2
+        if e.get("prev_entry_hash") != prev:
+            print(f"FAIL: receipt chain broken at index {i}", file=sys.stderr)
+            return 2
+        eh = e.get("entry_hash")
+        if not isinstance(eh, str) or not eh:
+            print(f"FAIL: receipts[{i}] missing entry_hash", file=sys.stderr)
+            return 2
+        calc = _entry_hash(e)
+        if calc != eh:
+            print(f"FAIL: receipts[{i}] entry_hash mismatch", file=sys.stderr)
+            return 2
+        prev = eh
+
 
     for i, entry in enumerate(receipts):
         if not isinstance(entry, dict):
@@ -485,6 +644,12 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
             print(f"  expected: {expected_pubkey}", file=sys.stderr)
             print(f"  got: {actual_pubkey}", file=sys.stderr)
             return 2
+        
+        # policy binding per entry (optional unless policy-path supplied)
+        if policy_sha256_expected is not None:
+            if entry.get("policy_sha256") != policy_sha256_expected:
+                print(f"FAIL: receipts[{i}] policy_sha256 mismatch vs policy-path", file=sys.stderr)
+                return 2
 
         # Load pubkey + verify receipt cryptographically
         pj2 = _read_json(pp)
@@ -621,6 +786,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Policy id (default: env VACI_POLICY_ID)",
     )
     runp.add_argument("--call-id", default=None, help="Call id (default: auto-generated per invocation)")
+    runp.add_argument("--policy-path", default=None, help="Path to policy file; binds sha256 into receipts+manifest")
 
     runp.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute (use: vaci run -- <cmd>)")
     runp.set_defaults(fn=cmd_run)
@@ -652,6 +818,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to trusted signer key allowlist (default: trusted_keys.json)",
     )
     mp.add_argument("--pubkey", default=None, help="Optional override pubkey file (otherwise uses manifest receipts[0])")
+    mp.add_argument("--require-finalized", action="store_true", help="Fail unless manifest finalized=true")
+    mp.add_argument("--policy-path", default=None, help="Policy file path; recompute sha256 and compare to manifest")
     mp.set_defaults(fn=cmd_verify_manifest)
 
     args = ap.parse_args(argv)
