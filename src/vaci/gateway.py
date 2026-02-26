@@ -12,6 +12,7 @@ from vaci.crypto import sign_obj_ed25519, verify_obj_ed25519, generate_ed25519_k
 from vaci.schema import Signature
 import json
 from pathlib import Path
+from vaci.crypto import sign_obj_ed25519, verify_obj_ed25519
 
 def _b64(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
@@ -21,6 +22,50 @@ def _sha256_bytes(data: bytes) -> bytes:
     import hashlib
     return hashlib.sha256(data).digest()
 
+
+def sign_manifest(privkey: bytes, manifest_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Returns a manifest object with:
+      - manifest_hash (HashRef)
+      - signature (Signature)
+    The signature is over the *payload only* (no signature fields included).
+    """
+    href, sig = sign_obj_ed25519(privkey, manifest_payload)
+    return {
+        **manifest_payload,
+        "manifest_hash": href.model_dump(),
+        "signature": sig.model_dump(),
+    }
+
+
+def verify_manifest(pubkey: bytes, manifest_json: Dict[str, Any]) -> bool:
+    """
+    Verify manifest signature (and optional hash consistency).
+    """
+    sigj = manifest_json.get("signature")
+    if not isinstance(sigj, dict):
+        return False
+
+    # payload = manifest without signature fields
+    payload = dict(manifest_json)
+    payload.pop("signature", None)
+    payload.pop("manifest_hash", None)
+
+    sig = Signature(**sigj)
+
+    ok = verify_obj_ed25519(pubkey, payload, sig)
+    if not ok:
+        return False
+
+    # optional: if manifest_hash exists, ensure it matches payload
+    mh = manifest_json.get("manifest_hash")
+    if isinstance(mh, dict):
+        from vaci.crypto import hashref_sha256_from_obj
+        href, _ = hashref_sha256_from_obj(payload)
+        if mh.get("alg") != href.alg or mh.get("hex") != href.hex or mh.get("size_bytes") != href.size_bytes:
+            return False
+
+    return True
 
 @dataclass(frozen=True)
 class Receipt:
@@ -104,6 +149,10 @@ class LocalGateway:
     @property
     def public_key(self) -> bytes:
         return self._pub
+
+    @property
+    def private_key_bytes(self) -> bytes:
+        return self._priv
 
     def run(
         self,

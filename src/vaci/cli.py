@@ -10,9 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-from vaci.gateway import LocalGateway, Receipt, verify_receipt
 from vaci.trust import TrustError, assert_trusted_signer, key_id_from_receipt_json
-
+from vaci.gateway import LocalGateway, Receipt, verify_receipt, sign_manifest
 
 def _write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +145,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("Hint: run: vaci keygen --out .vaci_keys/gateway_ed25519.key", file=sys.stderr)
             return 2
 
-
     receipt = gw.run(
     args.command,
     cwd=args.cwd,
@@ -191,7 +189,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     except Exception:
         git_sha = None
 
-    manifest = {
+    manifest_payload = {
         "run_id": run_id,
         "policy_id": policy_id,
         "git_sha": git_sha,
@@ -205,7 +203,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             }
         ],
     }
-    _write_json(out_dir / "run_manifest.json", manifest)
+
+    signed_manifest = sign_manifest(gw.private_key_bytes, manifest_payload)
+    _write_json(out_dir / "run_manifest.json", signed_manifest)
     # --------------------------
 
     return 0
