@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from vaci.gateway import LocalGateway, Receipt, verify_receipt
-
+from vaci.trust import TrustError, assert_trusted_signer, key_id_from_receipt_json
 
 def _write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +68,14 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print("FAIL: receipt verification failed", file=sys.stderr)
         return 2
 
+    # NEW: trust root enforcement (must be after signature verification)
+    try:
+        key_id = key_id_from_receipt_json(rj, pubkey_raw)
+        assert_trusted_signer(key_id=key_id, trust_path=args.trust)
+    except TrustError as e:
+        print(f"FAIL: trust check failed: {e}", file=sys.stderr)
+        return 2
+
     print("OK: receipt verified", file=sys.stderr)
     return 0
 
@@ -84,6 +92,11 @@ def main(argv: list[str] | None = None) -> int:
     verp = sp.add_parser("verify", help="Verify a receipt artifact")
     verp.add_argument("--receipt", default=".vaci/receipt.json")
     verp.add_argument("--pubkey", default=".vaci/public_key_b64.json")
+    verp.add_argument(
+    "--trust",
+    default="trusted_keys.json",
+    help="Path to trusted signer key allowlist (default: trusted_keys.json)",
+)
     verp.set_defaults(fn=cmd_verify)
 
     args = ap.parse_args(argv)
