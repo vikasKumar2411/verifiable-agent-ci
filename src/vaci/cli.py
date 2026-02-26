@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -20,6 +21,21 @@ def _write_json(path: Path, obj: Any) -> None:
 
 def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _manifest_payload_from_signed(mj: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Take a signed manifest json dict and return the unsigned payload object
+    suitable for re-signing (drops signature  manifest_hash).
+    """
+    payload = dict(mj)
+    payload.pop("signature", None)
+    payload.pop("manifest_hash", None)
+    return payload
+
 def cmd_keygen(args: argparse.Namespace) -> int:
     """
     Generate a persistent gateway keyfile (raw Ed25519 keys stored as URL-safe base64).
@@ -118,6 +134,39 @@ def cmd_trust_add(args: argparse.Namespace) -> int:
     print(f"OK: trusted key_id {key_id}", file=sys.stderr)
     return 0
 
+def cmd_finalize(args: argparse.Namespace) -> int:
+    """
+    Finalize a run_manifest.json (set finalized=true) and re-sign it.
+    After finalization, cmd_run will refuse to append additional receipts.
+    """
+    manifest_path = Path(args.manifest)
+    if not manifest_path.exists():
+        print(f"FAIL: manifest not found: {manifest_path}", file=sys.stderr)
+        return 2
+
+    # Load gateway key for re-sign
+    try:
+        gw = LocalGateway.from_keyfile(args.keyfile)
+    except FileNotFoundError:
+        print(f"FAIL: gateway keyfile not found: {args.keyfile}", file=sys.stderr)
+        print("Hint: run: vaci keygen --out .vaci_keys/gateway_ed25519.key", file=sys.stderr)
+        return 2
+
+    mj = _read_json(manifest_path)
+    payload = _manifest_payload_from_signed(mj)
+
+    if payload.get("finalized") is True:
+        print("OK: manifest already finalized", file=sys.stderr)
+        return 0
+
+    payload["finalized"] = True
+    payload["updated_at_ms"] = _now_ms()
+
+    signed = sign_manifest(gw.private_key_bytes, payload)
+    _write_json(manifest_path, signed)
+
+    print(f"OK: manifest finalized: {manifest_path}", file=sys.stderr)
+    return 0
 
 def cmd_run(args: argparse.Namespace) -> int:
     import base64 as _b64
@@ -161,17 +210,29 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     out_dir = Path(args.out_dir)
 
-    pubkey_path = out_dir / "public_key_b64.json"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-call artifacts (session mode)
+    receipt_name = f"receipt_{call_id}.json"
+    pubkey_name = f"public_key_{call_id}.json"
+
+    pubkey_path = out_dir / pubkey_name
     _write_json(
         pubkey_path,
         {"pubkey_b64": _b64.urlsafe_b64encode(pubkey_bytes).decode("ascii").rstrip("=")},
     )
 
-    receipt_path = out_dir / "receipt.json"
+    receipt_path = out_dir / receipt_name
     _write_json(receipt_path, receipt.to_dict())
+
+    # Back-compat / convenience: also write the "latest" filenames
+    _write_json(out_dir / "public_key_b64.json", {"pubkey_b64": _b64.urlsafe_b64encode(pubkey_bytes).decode("ascii").rstrip("=")})
+    _write_json(out_dir / "receipt.json", receipt.to_dict())
 
     # ---- NEW: run manifest ----
     import subprocess
+
+    manifest_path = out_dir / "run_manifest.json"
 
     def _sha256_file(path: Path) -> str:
         h = hashlib.sha256()
@@ -185,23 +246,59 @@ def cmd_run(args: argparse.Namespace) -> int:
     except Exception:
         git_sha = None
 
-    manifest_payload = {
-        "run_id": run_id,
-        "policy_id": policy_id,
-        "git_sha": git_sha,
-        "receipts": [
-            {
-                "call_id": call_id,
-                "receipt_path": receipt_path.name,
-                "receipt_sha256": _sha256_file(receipt_path),
-                "pubkey_path": pubkey_path.name,
-                "pubkey_sha256": _sha256_file(pubkey_path),
-            }
-        ],
+    entry = {
+        "call_id": call_id,
+        "created_at_ms": _now_ms(),
+        "receipt_path": receipt_path.name,
+        "receipt_sha256": _sha256_file(receipt_path),
+        "pubkey_path": pubkey_path.name,
+        "pubkey_sha256": _sha256_file(pubkey_path),
     }
 
-    signed_manifest = sign_manifest(gw.private_key_bytes, manifest_payload)
-    _write_json(out_dir / "run_manifest.json", signed_manifest)
+    if manifest_path.exists():
+        mj = _read_json(manifest_path)
+        payload = _manifest_payload_from_signed(mj)
+
+        # enforce session invariants
+        if payload.get("finalized") is True:
+            print("FAIL: manifest is finalized; refusing to append", file=sys.stderr)
+            return 2
+
+        if payload.get("run_id") != run_id:
+            print(f"FAIL: run_id mismatch vs existing manifest ({payload.get('run_id')} != {run_id})", file=sys.stderr)
+            return 2
+        if payload.get("policy_id") != policy_id:
+            print(f"FAIL: policy_id mismatch vs existing manifest ({payload.get('policy_id')} != {policy_id})", file=sys.stderr)
+            return 2
+
+        receipts = payload.get("receipts")
+        if not isinstance(receipts, list):
+            print("FAIL: manifest payload receipts must be a list", file=sys.stderr)
+            return 2
+
+        # keep created_at_ms stable; bump updated_at_ms
+        payload.setdefault("created_at_ms", _now_ms())
+        payload["updated_at_ms"] = _now_ms()
+        payload.setdefault("finalized", False)
+
+        # preserve git_sha from first creation unless missing
+        if payload.get("git_sha") is None:
+            payload["git_sha"] = git_sha
+
+        receipts.append(entry)
+    else:
+        payload = {
+            "run_id": run_id,
+            "policy_id": policy_id,
+            "git_sha": git_sha,
+            "created_at_ms": _now_ms(),
+            "updated_at_ms": _now_ms(),
+            "finalized": False,
+            "receipts": [entry],
+        }
+
+    signed_manifest = sign_manifest(gw.private_key_bytes, payload)
+    _write_json(manifest_path, signed_manifest)
     # --------------------------
 
     return 0
@@ -527,6 +624,15 @@ def main(argv: list[str] | None = None) -> int:
 
     runp.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute (use: vaci run -- <cmd>)")
     runp.set_defaults(fn=cmd_run)
+
+    finp = sp.add_parser("finalize", help="Finalize run_manifest.json (lock session; prevents further appends)")
+    finp.add_argument("--manifest", default=".vaci/run_manifest.json", help="Path to run_manifest.json")
+    finp.add_argument(
+        "--keyfile",
+        default=".vaci_keys/gateway_ed25519.key",
+        help="Gateway private keyfile used to sign the manifest",
+    )
+    finp.set_defaults(fn=cmd_finalize)
 
     verp = sp.add_parser("verify", help="Verify a receipt artifact")
     verp.add_argument("--receipt", default=".vaci/receipt.json")
