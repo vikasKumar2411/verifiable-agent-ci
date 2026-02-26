@@ -1,11 +1,14 @@
+# /Users/vikaskumar/Desktop/verifiable-agent-ci/tests/test_cli_receipt.py
 import json
 import subprocess
 from pathlib import Path
+
 
 def test_receipt_tamper_fails(tmp_path: Path):
     out = tmp_path / ".vaci"
     cmd = [
         "python", "-m", "vaci.cli", "run",
+        "--ephemeral",
         "--out-dir", str(out),
         "--",
         "python", "-c", "print('hello from vaci')"

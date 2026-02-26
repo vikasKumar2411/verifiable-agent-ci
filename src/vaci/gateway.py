@@ -10,7 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from vaci.crypto import sign_obj_ed25519, verify_obj_ed25519, generate_ed25519_keypair
 from vaci.schema import Signature
-
+import json
+from pathlib import Path
 
 def _b64(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
@@ -69,6 +70,30 @@ class LocalGateway:
     def ephemeral(cls) -> "LocalGateway":
         priv, pub = generate_ed25519_keypair()
         return cls(priv, pub)
+
+    @classmethod
+    def from_keyfile(cls, path: str | Path) -> "LocalGateway":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Gateway keyfile not found: {p}")
+
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Invalid gateway keyfile: expected JSON object")
+
+        priv_b64 = data.get("privkey_b64")
+        pub_b64 = data.get("pubkey_b64")
+        if not isinstance(priv_b64, str) or not isinstance(pub_b64, str):
+            raise ValueError("Invalid gateway keyfile: expected privkey_b64 and pubkey_b64 strings")
+
+        priv = base64.urlsafe_b64decode(priv_b64 + "==")
+        pub = base64.urlsafe_b64decode(pub_b64 + "==")
+
+        key_id = data.get("key_id")
+        if key_id is not None and not isinstance(key_id, str):
+            raise ValueError("Invalid gateway keyfile: key_id must be a string if present")
+
+        return cls(priv, pub, key_id=key_id)
 
     @property
     def public_key(self) -> bytes:

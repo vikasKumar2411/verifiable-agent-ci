@@ -13,7 +13,18 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 from cryptography.hazmat.primitives import serialization
 
 from vaci.schema import HashRef, Signature
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
+
+def _privkey_obj(priv: ed25519.Ed25519PrivateKey | bytes) -> ed25519.Ed25519PrivateKey:
+    if isinstance(priv, (bytes, bytearray)):
+        return ed25519.Ed25519PrivateKey.from_private_bytes(bytes(priv))
+    return priv
+
+def _pubkey_obj(pub: ed25519.Ed25519PublicKey | bytes) -> ed25519.Ed25519PublicKey:
+    if isinstance(pub, (bytes, bytearray)):
+        return ed25519.Ed25519PublicKey.from_public_bytes(bytes(pub))
+    return pub
 
 # ----------------------------
 # Canonicalization + hashing
@@ -112,6 +123,7 @@ def sign_obj_ed25519(priv: Ed25519PrivateKey, obj: Any) -> Tuple[HashRef, Signat
       - Signature over canonical payload bytes
     """
     href, payload = hashref_sha256_from_obj(obj)
+    priv = _privkey_obj(priv)
     pub = priv.public_key()
     kid = public_key_id(pub)
     sig_b64 = sign_payload_bytes_ed25519(priv, payload)
@@ -142,6 +154,7 @@ class SignedPayload:
 
 def sign_obj_ed25519_with_bytes(priv: Ed25519PrivateKey, obj: Any) -> SignedPayload:
     href, payload = hashref_sha256_from_obj(obj)
+    priv = _privkey_obj(priv)
     pub = priv.public_key()
     kid = public_key_id(pub)
     sig_b64 = sign_payload_bytes_ed25519(priv, payload)

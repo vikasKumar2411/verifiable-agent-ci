@@ -18,6 +18,7 @@ def test_verify_fails_when_signer_untrusted(tmp_path: Path, monkeypatch):
     a.out_dir = str(out_dir)
     a.cwd = None
     a.command = ["echo", "hello"]
+    a.ephemeral = True
     assert cmd_run(a) == 0
 
     # empty trust store
@@ -40,6 +41,7 @@ def test_verify_passes_when_signer_trusted(tmp_path: Path):
     a.out_dir = str(out_dir)
     a.cwd = None
     a.command = ["echo", "hello"]
+    a.ephemeral = True
     assert cmd_run(a) == 0
 
     receipt = json.loads((out_dir / "receipt.json").read_text(encoding="utf-8"))

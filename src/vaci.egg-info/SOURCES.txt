@@ -1,0 +1,16 @@
+pyproject.toml
+src/vaci/__init__.py
+src/vaci/cli.py
+src/vaci/crypto.py
+src/vaci/gateway.py
+src/vaci/schema.py
+src/vaci/trust.py
+src/vaci.egg-info/PKG-INFO
+src/vaci.egg-info/SOURCES.txt
+src/vaci.egg-info/dependency_links.txt
+src/vaci.egg-info/entry_points.txt
+src/vaci.egg-info/requires.txt
+src/vaci.egg-info/top_level.txt
+src/vaci/adapters/__init__.py
+tests/test_cli_receipt.py
+tests/test_gateway_receipts.py
