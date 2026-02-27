@@ -1,0 +1,111 @@
+name: VACI (verifiable agent CI)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  vaci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      # Use a stable signer if present, otherwise generate one (fork-friendly).
+      - name: Write gateway key (from secret)
+        if: ${{ secrets.VACI_GATEWAY_KEY_JSON != '' }}
+        env:
+          VACI_GATEWAY_KEY_JSON: ${{ secrets.VACI_GATEWAY_KEY_JSON }}
+        run: |
+          mkdir -p .vaci_keys
+          printf "%s" "$VACI_GATEWAY_KEY_JSON" > .vaci_keys/gateway_ed25519.key
+          chmod 600 .vaci_keys/gateway_ed25519.key
+
+      - name: Generate gateway key (fallback for forks)
+        if: ${{ secrets.VACI_GATEWAY_KEY_JSON == '' }}
+        run: |
+          mkdir -p .vaci_keys
+          python -m vaci.cli keygen --out .vaci_keys/gateway_ed25519.key
+
+      - name: Prepare trust store (pin this signer)
+        run: |
+          python - <<'PY'
+          import json, base64, hashlib
+          from pathlib import Path
+
+          kf = Path(".vaci_keys/gateway_ed25519.key")
+          data = json.loads(kf.read_text(encoding="utf-8"))
+          pub_raw = base64.urlsafe_b64decode(data["pubkey_b64"] + "==")
+          key_id = hashlib.sha256(pub_raw).hexdigest()
+
+          Path(".vaci").mkdir(parents=True, exist_ok=True)
+          Path(".vaci/trusted_keys.json").write_text(
+              json.dumps({"trusted_key_ids":[key_id]}, indent=2, sort_keys=True),
+              encoding="utf-8"
+          )
+          print("Pinned trusted key_id:", key_id)
+          PY
+
+      - name: Run tests via VACI (produces receipts + manifest)
+        run: |
+          rm -rf .vaci
+          mkdir -p .vaci
+
+          RID="ci_${{ github.run_id }}_${{ github.run_attempt }}"
+
+          python -m vaci.cli run \
+            --out-dir .vaci \
+            --keyfile .vaci_keys/gateway_ed25519.key \
+            --run-id "$RID" \
+            --policy-id demo \
+            --policy-path demo/policy.json \
+            -- echo "hello from CI"
+
+          python -m vaci.cli run \
+            --out-dir .vaci \
+            --keyfile .vaci_keys/gateway_ed25519.key \
+            --run-id "$RID" \
+            --policy-id demo \
+            --policy-path demo/policy.json \
+            -- pytest -q
+
+      - name: Verify latest receipt (sanity check)
+        run: |
+          python -m vaci.cli verify \
+            --receipt .vaci/receipt.json \
+            --pubkey .vaci/public_key_b64.json \
+            --trust .vaci/trusted_keys.json
+
+      - name: Finalize manifest
+        run: |
+          python -m vaci.cli finalize \
+            --manifest .vaci/run_manifest.json \
+            --keyfile .vaci_keys/gateway_ed25519.key
+
+      - name: Verify manifest (must be finalized + policy-bound)
+        run: |
+          python -m vaci.cli verify-manifest \
+            --manifest .vaci/run_manifest.json \
+            --trust .vaci/trusted_keys.json \
+            --require-finalized \
+            --policy-path demo/policy.json
+
+      - name: Upload VACI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaci-artifacts
+          path: .vaci

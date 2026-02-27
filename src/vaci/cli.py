@@ -127,19 +127,23 @@ def _manifest_payload_from_signed(mj: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 def cmd_keygen(args: argparse.Namespace) -> int:
-    """
-    Generate a persistent gateway keyfile (raw Ed25519 keys stored as URL-safe base64).
-    Output format:
-      {
-        "kty": "Ed25519",
-        "format": "raw",
-        "privkey_b64": "...",
-        "pubkey_b64": "...",
-        "key_id": "sha256(pubkey_raw).hexdigest()"
-      }
-    """
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out_arg = Path(args.out)
+
+    out_is_dir = (
+        (out_arg.exists() and out_arg.is_dir())
+        or str(args.out).endswith(os.sep)
+        or (out_arg.suffix == "")
+    )
+
+    if out_is_dir:
+        out_dir = out_arg
+        out_dir.mkdir(parents=True, exist_ok=True)
+        keyfile_path = out_dir / "gateway_ed25519.key"
+        pubfile_path = out_dir / "public_key_b64.json"
+    else:
+        keyfile_path = out_arg
+        keyfile_path.parent.mkdir(parents=True, exist_ok=True)
+        pubfile_path = keyfile_path.parent / "public_key_b64.json"
 
     from vaci.crypto import generate_ed25519_keypair
 
@@ -177,18 +181,19 @@ def cmd_keygen(args: argparse.Namespace) -> int:
         "pubkey_b64": base64.urlsafe_b64encode(pub).decode("ascii").rstrip("="),
         "key_id": key_id,
     }
-    _write_json(out, obj)
 
-    # best-effort perms (mac/linux)
+    _write_json(keyfile_path, obj)
+    _write_json(pubfile_path, {"pubkey_b64": obj["pubkey_b64"]})
+
     try:
-        os.chmod(out, 0o600)
+        os.chmod(keyfile_path, 0o600)
     except Exception:
         pass
 
-    print(f"OK: wrote gateway keyfile to {out}", file=sys.stderr)
+    print(f"OK: wrote gateway keyfile to {keyfile_path}", file=sys.stderr)
+    print(f"OK: wrote public key to {pubfile_path}", file=sys.stderr)
     print(f"key_id: {key_id}", file=sys.stderr)
     return 0
-
 
 def cmd_trust_add(args: argparse.Namespace) -> int:
     """
@@ -295,13 +300,40 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("Hint: run: vaci keygen --out .vaci_keys/gateway_ed25519.key", file=sys.stderr)
             return 2
 
-    receipt = gw.run(
-        args.command,
-        cwd=args.cwd,
-        run_id=run_id,
-        policy_id=policy_id,
-        call_id=call_id,
-    )
+    # ---- V2: enforce policy BEFORE execution ----
+    deny_reason = None
+    if policy_path:
+        try:
+            from vaci.core.policy import load_policy, evaluate
+
+            pol = load_policy(policy_path)
+            dec = evaluate(pol, args.command, cwd=args.cwd or os.getcwd())
+            if not dec.allowed:
+                deny_reason = dec.reason
+        except Exception as e:
+            # Policy read/parse errors are treated as hard fail (safer default)
+            print(f"FAIL: policy evaluation error: {e}", file=sys.stderr)
+            return 2
+
+    if deny_reason is not None:
+        receipt = gw.run_denied(
+            args.command,
+            cwd=args.cwd,
+            run_id=run_id,
+            policy_id=policy_id,
+            call_id=call_id,
+            policy_sha256=policy_sha256,
+            deny_reason=deny_reason,
+        )
+    else:
+        receipt = gw.run(
+            args.command,
+            cwd=args.cwd,
+            run_id=run_id,
+            policy_id=policy_id,
+            call_id=call_id,
+            policy_sha256=policy_sha256,
+        )
 
     pk = gw.public_key
     # Support both "raw bytes" or "cryptography key object"
@@ -343,7 +375,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Safety: if manifest exists, require explicit run-id (or env VACI_RUN_ID) to append.
     if manifest_path.exists() and not (getattr(args, "run_id", None) or os.environ.get("VACI_RUN_ID")):
-        print("FAIL: manifest exists; refusing to append without explicit --run-id (or env VACI_RUN_ID)", file=sys.stderr)
+        print(
+            "FAIL: manifest exists; refusing to append without explicit --run-id (or env VACI_RUN_ID)\n"
+            "Hint: either:\n"
+            "  - pass --run-id <same as the existing manifest>, or\n"
+            "  - start a new session (rm -rf .vaci / use a different --out-dir).",
+            file=sys.stderr,
+        )
         return 2
 
     entry = {
@@ -362,7 +400,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         # enforce session invariants
         if payload.get("finalized") is True:
-            print("FAIL: manifest is finalized; refusing to append", file=sys.stderr)
+            print(
+                "FAIL: manifest is finalized; refusing to append\n"
+                "Hint: start a new session by:\n"
+                "  - removing the out-dir (e.g. rm -rf .vaci), or\n"
+                "  - using a different --out-dir, or\n"
+                "  - using a new run_id in a fresh directory.",
+                file=sys.stderr,
+            )
             return 2
 
         if payload.get("run_id") != run_id:
@@ -430,7 +475,6 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     """
     import base64 as _b64
     from pathlib import Path
-    from cryptography.hazmat.primitives.asymmetric import ed25519
 
     from vaci.crypto import hashref_sha256_from_obj, verify_obj_ed25519
     from vaci.schema import Signature
@@ -445,7 +489,6 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     except FileNotFoundError as e:
         print(f"FAIL: policy file not found: {e}", file=sys.stderr)
         return 2
-
 
     # -------- helpers --------
     def _sha256_file(path: Path) -> str:
@@ -504,7 +547,8 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
         return 2
 
     pubkey_raw = _b64.urlsafe_b64decode(pub_b64 + "==")
-    pubkey = ed25519.Ed25519PublicKey.from_public_bytes(pubkey_raw)
+    # IMPORTANT: vaci.crypto.verify_obj_ed25519 expects raw pubkey bytes (not a cryptography key object)
+    pubkey = pubkey_raw
 
     # -------- Variant-B only --------
     payload_b = dict(mj)
@@ -554,7 +598,10 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
 
     if signer_key_id not in set(ids):
         print(f"FAIL: untrusted signer key_id {signer_key_id}", file=sys.stderr)
-        print(f"Hint: python -m vaci.cli trust add --pubkey .vaci/public_key_b64.json --trust {trust_path}", file=sys.stderr)
+        print(
+            f"Hint: python -m vaci.cli trust add --pubkey .vaci/public_key_b64.json --trust {trust_path}",
+            file=sys.stderr,
+        )
         return 2
 
     # -------- verify referenced files + receipts --------
@@ -580,7 +627,7 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     if policy_id is not None and not isinstance(policy_id, str):
         print("FAIL: manifest policy_id must be a string if present", file=sys.stderr)
         return 2
-    
+
     # -------- verify receipt entry chain (reorder/delete detection) --------
     prev = None
     for i, e in enumerate(receipts):
@@ -599,7 +646,6 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
             print(f"FAIL: receipts[{i}] entry_hash mismatch", file=sys.stderr)
             return 2
         prev = eh
-
 
     for i, entry in enumerate(receipts):
         if not isinstance(entry, dict):
@@ -633,7 +679,100 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
             print(f"  expected: {expected_pubkey}", file=sys.stderr)
             print(f"  got: {actual_pubkey}", file=sys.stderr)
             return 2
-        
+
+        # ---- OPTIONAL: toolcall sidecar binding (agent runner) ----
+        toolcall_rel = entry.get("toolcall_path")
+        if toolcall_rel is not None:
+            if not isinstance(toolcall_rel, str) or not toolcall_rel:
+                print(f"FAIL: receipts[{i}] toolcall_path must be a non-empty string", file=sys.stderr)
+                return 2
+
+            expected_toolcall = entry.get("toolcall_sha256")
+            if not isinstance(expected_toolcall, str) or not expected_toolcall:
+                print(f"FAIL: receipts[{i}] missing toolcall_sha256", file=sys.stderr)
+                return 2
+
+            tp = _abs_from_manifest(toolcall_rel)
+            if not tp.exists():
+                print("FAIL: toolcall file missing", file=sys.stderr)
+                print(f"  file: {tp}", file=sys.stderr)
+                return 2
+
+            actual_toolcall = _sha256_file(tp)
+            if actual_toolcall != expected_toolcall:
+                print("FAIL: toolcall sha256 mismatch", file=sys.stderr)
+                print(f"  file: {tp}", file=sys.stderr)
+                print(f"  expected: {expected_toolcall}", file=sys.stderr)
+                print(f"  got: {actual_toolcall}", file=sys.stderr)
+                return 2
+                        # Deep-verify toolcall content (optional but recommended):
+            # - ensure required fields exist
+            # - verify toolcall_record_sha256 binds (tool,args,result)
+            try:
+                tcj = _read_json(tp)
+            except Exception as e:
+                print("FAIL: could not read toolcall json", file=sys.stderr)
+                print(f"  file: {tp}", file=sys.stderr)
+                print(f"  error: {e}", file=sys.stderr)
+                return 2
+
+            tool = tcj.get("tool")
+            args_j = tcj.get("args")
+            result_j = tcj.get("result")
+            if not isinstance(tool, str) or not tool:
+                print("FAIL: toolcall missing tool", file=sys.stderr)
+                print(f"  file: {tp}", file=sys.stderr)
+                return 2
+            if "args" not in tcj or "result" not in tcj:
+                print("FAIL: toolcall missing args/result", file=sys.stderr)
+                print(f"  file: {tp}", file=sys.stderr)
+                return 2
+
+            # Verify args_sha256/result_sha256 if present in the toolcall file
+            args_sha = tcj.get("args_sha256")
+            if args_sha is not None:
+                if not isinstance(args_sha, str) or not args_sha:
+                    print("FAIL: toolcall args_sha256 must be a non-empty string when present", file=sys.stderr)
+                    print(f"  file: {tp}", file=sys.stderr)
+                    return 2
+                calc_args_sha = _sha256_obj(args_j)
+                if calc_args_sha != args_sha:
+                    print("FAIL: toolcall args_sha256 mismatch", file=sys.stderr)
+                    print(f"  file: {tp}", file=sys.stderr)
+                    print(f"  expected: {args_sha}", file=sys.stderr)
+                    print(f"  got: {calc_args_sha}", file=sys.stderr)
+                    return 2
+
+            result_sha = tcj.get("result_sha256")
+            if result_sha is not None:
+                if not isinstance(result_sha, str) or not result_sha:
+                    print("FAIL: toolcall result_sha256 must be a non-empty string when present", file=sys.stderr)
+                    print(f"  file: {tp}", file=sys.stderr)
+                    return 2
+                calc_result_sha = _sha256_obj(result_j)
+                if calc_result_sha != result_sha:
+                    print("FAIL: toolcall result_sha256 mismatch", file=sys.stderr)
+                    print(f"  file: {tp}", file=sys.stderr)
+                    print(f"  expected: {result_sha}", file=sys.stderr)
+                    print(f"  got: {calc_result_sha}", file=sys.stderr)
+                    return 2
+
+            # Verify record binding hash against entry or file (entry wins if present)
+            calc_record_sha = _sha256_obj({"tool": tool, "args": args_j, "result": result_j})
+            expected_record_sha = entry.get("toolcall_record_sha256") or tcj.get("toolcall_record_sha256")
+            if expected_record_sha is not None:
+                if not isinstance(expected_record_sha, str) or not expected_record_sha:
+                    print("FAIL: toolcall_record_sha256 must be a non-empty string when present", file=sys.stderr)
+                    print(f"  file: {tp}", file=sys.stderr)
+                    return 2
+                if calc_record_sha != expected_record_sha:
+                    print("FAIL: toolcall_record_sha256 mismatch", file=sys.stderr)
+                    print(f"  file: {tp}", file=sys.stderr)
+                    print(f"  expected: {expected_record_sha}", file=sys.stderr)
+                    print(f"  got: {calc_record_sha}", file=sys.stderr)
+                    return 2
+
+
         # policy binding per entry (optional unless policy-path supplied)
         if policy_sha256_expected is not None:
             if entry.get("policy_sha256") != policy_sha256_expected:
@@ -647,7 +786,6 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
             print(f"FAIL: pubkey file invalid: {pp}", file=sys.stderr)
             return 2
         pub_raw_2 = _b64.urlsafe_b64decode(pub_b64_2 + "==")
-        pub2 = ed25519.Ed25519PublicKey.from_public_bytes(pub_raw_2)
 
         rj = _read_json(rp)
         sig2 = rj.get("signature")
@@ -669,15 +807,27 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
                 stderr_b64=rj["stderr_b64"],
                 stdout_sha256_b64=rj["stdout_sha256_b64"],
                 stderr_sha256_b64=rj["stderr_sha256_b64"],
+                policy_sha256=rj.get("policy_sha256"),
+                policy_decision=rj.get("policy_decision"),
+                deny_reason=rj.get("deny_reason"),
                 signature=Signature(**sig2),
             )
         except Exception as e:
             print(f"FAIL: invalid receipt schema for {rp}: {e}", file=sys.stderr)
             return 2
 
-        if not verify_receipt(pub2, receipt):
+        if not verify_receipt(pub_raw_2, receipt):
             print(f"FAIL: receipt verification failed for {rp}", file=sys.stderr)
             return 2
+
+        # ---- V2: if policy-path is supplied, enforce that denied receipts fail verification ----
+        if policy_sha256_expected is not None:
+            # receipt JSON may be V1 (no policy_decision); treat missing as "allow"
+            decision = rj.get("policy_decision", "allow")
+            if decision == "deny":
+                reason = rj.get("deny_reason") or "policy denied"
+                print(f"FAIL: receipt denied by policy: {reason}", file=sys.stderr)
+                return 2
 
         # Consistency checks vs manifest
         if run_id is not None and receipt.run_id != run_id:
@@ -696,7 +846,6 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     import base64 as _b64
-    from cryptography.hazmat.primitives.asymmetric import ed25519
 
     receipt_path = Path(args.receipt)
     pubkey_path = Path(args.pubkey)
@@ -705,7 +854,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
     pj = _read_json(pubkey_path)
 
     pubkey_raw = _b64.urlsafe_b64decode(pj["pubkey_b64"] + "==")
-    pubkey = ed25519.Ed25519PublicKey.from_public_bytes(pubkey_raw)
     sig = rj["signature"]
 
     receipt = Receipt(
@@ -721,9 +869,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
         stderr_b64=rj["stderr_b64"],
         stdout_sha256_b64=rj["stdout_sha256_b64"],
         stderr_sha256_b64=rj["stderr_sha256_b64"],
+        # V2 fields are OPTIONAL but MUST be included when present,
+        # otherwise verify_receipt() will fall back to V1 payload and
+        # signature verification will fail for V2-signed receipts.
+        policy_sha256=rj.get("policy_sha256"),
+        policy_decision=rj.get("policy_decision"),
+        deny_reason=rj.get("deny_reason"),
         signature=__import__("vaci.schema", fromlist=["Signature"]).Signature(**sig),
     )
-    ok = verify_receipt(pubkey, receipt)
+    ok = verify_receipt(pubkey_raw, receipt)
     if not ok:
         print("FAIL: receipt verification failed", file=sys.stderr)
         return 2
@@ -746,7 +900,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Commit 2: keygen
     keyp = sp.add_parser("keygen", help="Generate a persistent gateway Ed25519 keyfile")
-    keyp.add_argument("--out", required=True, help="Output keyfile path (e.g. .vaci_keys/gateway_ed25519.key)")
+    keyp.add_argument(
+        "--out",
+        default=".vaci",
+        help="Output dir or keyfile path. If a directory, writes gateway_ed25519.key  public_key_b64.json there (default: .vaci)",
+    )
+
     keyp.set_defaults(fn=cmd_keygen)
 
     # Commit 2: trust add
@@ -764,7 +923,9 @@ def main(argv: list[str] | None = None) -> int:
     runp = sp.add_parser("run", help="Run a command and emit signed receipt artifacts")
     runp.add_argument("--out-dir", default=".vaci", help="Directory to write receipt artifacts")
     runp.add_argument("--cwd", default=None, help="Working directory")
-    runp.add_argument("--keyfile", default=".vaci_keys/gateway_ed25519.key", help="Gateway private keyfile")
+    runp.add_argument("--keyfile", default=".vaci/gateway_ed25519.key", help="Gateway private keyfile")
+
+
     runp.add_argument("--ephemeral", action="store_true", help="Use ephemeral key (dev/tests)")
 
     # NEW: ids
@@ -783,10 +944,10 @@ def main(argv: list[str] | None = None) -> int:
     finp = sp.add_parser("finalize", help="Finalize run_manifest.json (lock session; prevents further appends)")
     finp.add_argument("--manifest", default=".vaci/run_manifest.json", help="Path to run_manifest.json")
     finp.add_argument(
-        "--keyfile",
-        default=".vaci_keys/gateway_ed25519.key",
-        help="Gateway private keyfile used to sign the manifest",
-    )
+    "--keyfile",
+    default=".vaci/gateway_ed25519.key",
+    help="Gateway private keyfile used to sign the manifest",
+)
     finp.set_defaults(fn=cmd_finalize)
 
     verp = sp.add_parser("verify", help="Verify a receipt artifact")
