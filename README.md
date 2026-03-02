@@ -1,29 +1,27 @@
-VACI — Verifiable Agent Continuous Integration
+# VACI — Verifiable Agent Continuous Integration
 
-VACI (Verifiable Agent Continuous Integration) is a cryptographic execution harness for AI agents and CI systems.
+**VACI** is a cryptographic execution harness for AI agents and CI systems.
 
 It turns command and tool execution into tamper-evident, cryptographically verifiable artifacts.
 
-VACI provides:
+### VACI provides:
 
-🔐 Ed25519 signed execution receipts
+- 🔐 Ed25519 signed execution receipts
+- 📜 Hash-linked run manifests
+- 🧱 Policy-bound execution guarantees
+- 🛡️ Deterministic denial receipts
+- 📦 Portable verification bundles
+- 🔍 Toolcall attestation (args + results integrity)
+- 🧾 File attestation (repo/artifact tamper detection)
 
-📜 Hash-linked run manifests
+> **Minimal. Deterministic. Verifiable.**
 
-🧱 Policy-bound execution guarantees
+---
 
-🛡️ Deterministic denial receipts
+## 🚀 Quickstart (2 Minutes)
 
-📦 Portable verification bundles
-
-🔍 Toolcall attestation (args + results integrity)
-
-🧾 File attestation (repo/artifact tamper detection)
-
-Minimal. Deterministic. Verifiable.
-
-🚀 Quickstart (2 Minutes)
-Install
+### Install
+```bash
 git clone https://github.com/vikasKumar2411/verifiable-agent-ci.git
 cd verifiable-agent-ci
 
@@ -32,24 +30,28 @@ source .venv/bin/activate
 
 pip install -e .
 pytest -q
-Start a Verifiable Session
+```
+
+### Start a Verifiable Session
+```bash
 python -m vaci.cli session --preset pr-agent
+```
 
 Copy and execute the exported environment variables shown in output.
 
-Run Commands
+### Run Commands
+```bash
 python -m vaci.cli run -- pytest -q
 python -m vaci.cli run -- echo "hello"
+```
 
 Each run produces:
+- A signed receipt
+- A chained manifest entry
+- Optional sidecars (if enabled)
 
-A signed receipt
-
-A chained manifest entry
-
-Optional sidecars (if enabled)
-
-Finalize + Verify
+### Finalize + Verify
+```bash
 python -m vaci.cli finalize --manifest $VACI_OUT_DIR/run_manifest.json
 
 python -m vaci.cli verify-manifest \
@@ -57,224 +59,153 @@ python -m vaci.cli verify-manifest \
   --trust $VACI_TRUST \
   --policy-path $VACI_POLICY_PATH \
   --enforce-policy
+```
 
-If anything was:
+If anything was reordered, deleted, re-signed, policy-violating, or tampered — **verification fails**.
 
-Reordered
+---
 
-Deleted
-
-Re-signed
-
-Policy-violating
-
-Tampered
-
-Verification fails.
-
-Why VACI Exists
+## Why VACI Exists
 
 AI agents can:
+- Execute shell commands
+- Modify repositories
+- Call external tools
+- Fetch network resources
+- Perform multi-step workflows
 
-Execute shell commands
+But today there is typically **no cryptographic proof** of:
+- What actually ran
+- In what order
+- Under which policy
+- Signed by which identity
+- Whether something was denied
+- Whether tool inputs/outputs were modified
+- Whether referenced files were altered
 
-Modify repositories
+**VACI provides that missing execution trust layer.**
 
-Call external tools
+---
 
-Fetch network resources
+## Core Guarantees
 
-Perform multi-step workflows
-
-But today there is typically no cryptographic proof of:
-
-What actually ran
-
-In what order
-
-Under which policy
-
-Signed by which identity
-
-Whether something was denied
-
-Whether tool inputs/outputs were modified
-
-Whether referenced files were altered
-
-VACI provides that missing execution trust layer.
-
-Core Guarantees
-🔐 Signed Receipts
+### 🔐 Signed Receipts
 
 Every command execution produces a signed receipt containing:
 
-run_id
+| Field | Description |
+|---|---|
+| `run_id` | Unique session identifier |
+| `policy_id` | Bound policy reference |
+| `call_id` | Per-command identifier |
+| `command + cwd` | What ran and where |
+| `timestamps` | Start/end times |
+| `exit code` | Result code |
+| `stdout/stderr digests` | Output integrity hashes |
 
-policy_id
+Receipts are signed with **Ed25519**.
 
-call_id
-
-command + cwd
-
-timestamps
-
-exit code
-
-stdout/stderr digests
-
-optional policy binding
-
-optional file/tool attestations
-
-Receipts are signed with Ed25519.
-
-📜 Hash-Linked Manifest
+### 📜 Hash-Linked Manifest
 
 Receipts are chained:
-
+```
 prev_entry_hash → entry_hash
+```
 
-Reordering or deletion breaks verification
+Reordering or deletion breaks verification. The manifest itself is signed and hash-bound.
 
-Manifest is signed and hash-bound
-
-🧱 Policy Binding
+### 🧱 Policy Binding
 
 When a policy is supplied:
+- `policy_sha256` is bound into receipts
+- Allow/deny decisions are signed
+- Denials produce deterministic signed receipts
+- `--enforce-policy` fails verification if violations exist
 
-policy_sha256 is bound into receipts
-
-Allow/deny decisions are signed
-
-Denials produce deterministic signed receipts
-
---enforce-policy fails verification if violations exist
-
-🧾 File Attestation
+### 🧾 File Attestation
 
 Optional sidecars record SHA256 digests of:
+- Git changed files (`--attest-git-changed`)
+- Artifact directories (`--attest-path <dir>`)
 
-Git changed files (--attest-git-changed)
+Prevents silent modification of repository contents, build artifacts, and generated outputs.
 
-Artifact directories (--attest-path <dir>)
+---
 
-Prevents silent modification of:
+## Verification Invariants
 
-Repository contents
+`verify-manifest` enforces:
 
-Build artifacts
+- Manifest signature integrity
+- Receipt signature validity
+- Receipt chain integrity
+- No duplicate `call_id`
+- Monotonic timestamps
+- Single signer across manifest
+- Sidecar hash integrity
+- Policy consistency (if supplied)
 
-Generated outputs
+---
 
-Verification Invariants
-
-verify-manifest enforces:
-
-Manifest signature integrity
-
-Receipt signature validity
-
-Receipt chain integrity
-
-No duplicate call_id
-
-Monotonic timestamps
-
-Single signer across manifest
-
-Sidecar hash integrity
-
-Policy consistency (if supplied)
-
-Portable Bundles
+## Portable Bundles
 
 Create a verification bundle:
-
+```bash
 python -m vaci.cli bundle \
   --manifest $VACI_OUT_DIR/run_manifest.json \
   --trust $VACI_TRUST \
   --out demo_bundle.tgz
+```
 
 Verify elsewhere:
-
+```bash
 python -m vaci.cli verify-bundle demo_bundle.tgz
-Intended Use Cases
-
-Agentic CI enforcement
-
-PR automation auditing
-
-Secure LLM tool execution
-
-Reproducible automation workflows
-
-Cryptographic execution attestations
-
-Defense against silent tool misuse
-
-Security Model
-
-VACI assumes:
-
-The signing key is protected
-
-Verification occurs against a trusted key store
-
-Policies are deterministic and hashed
-
-VACI protects against:
-
-Receipt deletion
-
-Receipt reordering
-
-Mixed-signer injection
-
-Policy swapping
-
-Toolcall tampering
-
-File/artifact tampering
-
-Silent command denial
-
-Manifest mutation
-
-Status
-
-Fully functional CLI
-
-Session support
-
-Multi-receipt manifests
-
-Policy enforcement
-
-Sidecar attestations
-
-Portable bundles
-
-Passing test suite
-
-License
-
-MIT
-
+```
 
 ---
 
-This version is:
+## Intended Use Cases
 
-- Clean
-- Runnable
-- Security-serious
-- Not bloated
-- Appropriate for GitHub discovery
-- Appropriate for security engineers reviewing infra
+- Agentic CI enforcement
+- PR automation auditing
+- Secure LLM tool execution
+- Reproducible automation workflows
+- Cryptographic execution attestations
+- Defense against silent tool misuse
 
 ---
 
-If you want next:
+## Security Model
 
-We can add a **small architecture diagram section** (ASCII style) that makes this feel even mor
+**VACI assumes:**
+- The signing key is protected
+- Verification occurs against a trusted key store
+- Policies are deterministic and hashed
+
+**VACI protects against:**
+- Receipt deletion
+- Receipt reordering
+- Mixed-signer injection
+- Policy swapping
+- Toolcall tampering
+- File/artifact tampering
+- Silent command denial
+- Manifest mutation
+
+---
+
+## Status
+
+- ✅ Fully functional CLI
+- ✅ Session support
+- ✅ Multi-receipt manifests
+- ✅ Policy enforcement
+- ✅ Sidecar attestations
+- ✅ Portable bundles
+- ✅ Passing test suite
+
+---
+
+## License
+
+[MIT](LICENSE)
