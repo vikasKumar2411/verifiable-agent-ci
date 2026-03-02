@@ -1,0 +1,16 @@
+name: VACI CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  vaci:
+    uses: ./.github/workflows/vaci.yml
+    secrets: inherit
+    with:
+      python_version: "3.11"
+      policy_id: "demo"
+      policy_path: "demo/policy.json"
+      require_finalized: true
+      enforce_policy: false

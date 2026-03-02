@@ -1,5 +1,6 @@
 # /Users/vikaskumar/Desktop/verifiable-agent-ci/src/vaci/cli.py
 from __future__ import annotations
+from dataclasses import dataclass
 
 import subprocess
 import argparse
@@ -25,6 +26,160 @@ def _write_json(path: Path, obj: Any) -> None:
 
 def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+def _read_json_str(s: str) -> Any:
+    try:
+        return json.loads(s)
+    except Exception as e:
+        raise ValueError(f"invalid JSON: {e}")
+
+@dataclass
+class ToolcallInputs:
+    tool: str
+    args: Any
+    result: Any
+    toolcall_path: Path | None = None
+
+def _load_json_input(path: str | None, inline_json: str | None, label: str) -> Any:
+    """
+    Load JSON from either a file path or an inline JSON string. Exactly one may be provided.
+    If neither provided, returns None.
+    """
+    if path and inline_json:
+        raise ValueError(f"provide either --{label} or --{label}-json, not both")
+    if path:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        if not p.exists():
+            raise FileNotFoundError(str(p))
+        return _read_json(p)
+    if inline_json:
+        return _read_json_str(inline_json)
+    return None
+
+def _collect_toolcall_inputs(args: argparse.Namespace) -> ToolcallInputs | None:
+    """
+    Return ToolcallInputs if toolcall flags were provided, else None.
+    Supports:
+      - --tool  (--tool-args/--tool-args-json)  (--tool-result/--tool-result-json)
+      - OR --toolcall-path (prebuilt toolcall JSON containing {tool,args,result})
+    """
+    toolcall_path = getattr(args, "toolcall_path", None)
+    tool = getattr(args, "tool", None)
+    if toolcall_path:
+        # prebuilt file path mode
+        p = Path(toolcall_path).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        tcj = _read_json(p)
+        t = tcj.get("tool")
+        if not isinstance(t, str) or not t:
+            raise ValueError("toolcall file missing 'tool'")
+        if "args" not in tcj or "result" not in tcj:
+            raise ValueError("toolcall file missing 'args' or 'result'")
+        return ToolcallInputs(tool=t, args=tcj.get("args"), result=tcj.get("result"), toolcall_path=p)
+
+    if not tool:
+        return None
+
+    args_j = _load_json_input(getattr(args, "tool_args", None), getattr(args, "tool_args_json", None), "tool-args")
+    result_j = _load_json_input(getattr(args, "tool_result", None), getattr(args, "tool_result_json", None), "tool-result")
+    if args_j is None or result_j is None:
+        raise ValueError("when using --tool, you must provide both tool args and tool result")
+    return ToolcallInputs(tool=tool, args=args_j, result=result_j, toolcall_path=None)
+
+def _iter_files_under(root: Path) -> list[Path]:
+    """
+    Return all regular files under root (deterministic order).
+    """
+    root = root.resolve()
+    if root.is_file():
+        return [root]
+    if not root.exists():
+        raise FileNotFoundError(str(root))
+    out: list[Path] = []
+    for p in root.rglob("*"):
+        try:
+            if p.is_file():
+                out.append(p.resolve())
+        except Exception:
+            # ignore broken symlinks / permission issues
+            continue
+    out.sort(key=lambda x: str(x))
+    return out
+
+
+def _rel_or_abs(p: Path, base: Path) -> str:
+    """
+    Prefer a clean relative path when possible; otherwise return absolute string.
+    """
+    try:
+        rp = p.resolve().relative_to(base.resolve())
+        return str(rp)
+    except Exception:
+        return str(p.resolve())
+
+
+def _file_record(p: Path, base_dir: Path) -> Dict[str, Any]:
+    """
+    Record a single file digestsize. Path is relative-to-base when possible.
+    """
+    p = p.resolve()
+    try:
+        st = p.stat()
+        size = int(st.st_size)
+    except Exception:
+        size = None
+    rec: Dict[str, Any] = {
+        "path": _rel_or_abs(p, base_dir),
+        "sha256": _sha256_file(p),
+    }
+    if size is not None:
+        rec["size_bytes"] = size
+    return rec
+
+
+def _git_root(cwd: Path | None = None) -> Path:
+    """
+    Return git repo root. Raises on failure.
+    """
+    cwd_s = str(cwd or Path.cwd())
+    try:
+        top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True, cwd=cwd_s).strip()
+        return Path(top).resolve()
+    except Exception as e:
+        raise RuntimeError(f"not a git repo (or git unavailable): {e}")
+
+
+def _collect_git_changed_files(repo_root: Path) -> list[Path]:
+    """
+    Changed (uncommitted) files from `git diff --name-only` plus staged from `--cached`.
+    Returns absolute Paths, de-duped, deterministic order.
+    """
+    names: list[str] = []
+    try:
+        a = subprocess.check_output(["git", "diff", "--name-only"], text=True, cwd=str(repo_root)).splitlines()
+        names.extend([x.strip() for x in a if x.strip()])
+    except Exception:
+        pass
+    try:
+        b = subprocess.check_output(["git", "diff", "--name-only", "--cached"], text=True, cwd=str(repo_root)).splitlines()
+        names.extend([x.strip() for x in b if x.strip()])
+    except Exception:
+        pass
+
+    # de-dupe while keeping deterministic order
+    seen = set()
+    out: list[Path] = []
+    for n in names:
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append((repo_root / n).resolve())
+    out.sort(key=lambda x: str(x))
+    return out
+
 
 def _ensure_gitignore_has_vaci(gitignore_path: Path) -> None:
     """
@@ -373,6 +528,15 @@ def cmd_bundle(args: argparse.Namespace) -> int:
                 print(f"FAIL: manifest references missing toolcall file: {tp}", file=sys.stderr)
                 return 2
             files.append(tp)
+
+    # optional files sidecar
+    fp_rel = e.get("files_path")
+    if fp_rel is not None:
+        fp = _abs_from_manifest(fp_rel)
+        if not fp.exists():
+            print(f"FAIL: manifest references missing files sidecar: {fp}", file=sys.stderr)
+            return 2
+        files.append(fp)
 
     # Optional policy inclusion:
     # - if user passes --policy-path, include that file as "policy.json" in the bundle
@@ -828,6 +992,127 @@ def cmd_run(args: argparse.Namespace) -> int:
     _write_json(out_dir / "public_key_b64.json", {"pubkey_b64": _b64.urlsafe_b64encode(pubkey_bytes).decode("ascii").rstrip("=")})
     _write_json(out_dir / "receipt.json", receipt.to_dict())
 
+    # ---- OPTIONAL: toolcall sidecar (agent tooling) ----
+     #
+     # If provided, emit toolcall_<call_id>.json and bind its hashes into the manifest entry.
+     #
+    #
+    # If provided, emit toolcall_<call_id>.json and bind its hashes into the manifest entry.
+    #
+    toolcall_rel_name: str | None = None
+    toolcall_sha256: str | None = None
+    toolcall_record_sha256: str | None = None
+
+    try:
+        tcin = _collect_toolcall_inputs(args)
+    except FileNotFoundError as e:
+        print(f"FAIL: toolcall JSON file not found: {e}", file=sys.stderr)
+        return 2
+    except ValueError as e:
+        print(f"FAIL: toolcall args error: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"FAIL: toolcall processing error: {e}", file=sys.stderr)
+        return 2
+
+    if tcin is not None:
+        # If caller supplied a prebuilt toolcall file, we still copy it into out_dir with stable name
+        toolcall_path = out_dir / f"toolcall_{call_id}.json"
+        tc_obj = {
+            "tool": tcin.tool,
+            "args": tcin.args,
+            "result": tcin.result,
+        }
+        # Optional deep-check helpers (verifier already supports these)
+        tc_obj["args_sha256"] = _sha256_obj(tcin.args)
+        tc_obj["result_sha256"] = _sha256_obj(tcin.result)
+        tc_obj["toolcall_record_sha256"] = _sha256_obj({"tool": tcin.tool, "args": tcin.args, "result": tcin.result})
+
+        # Write canonical toolcall sidecar into out_dir
+        _write_json(toolcall_path, tc_obj)
+
+        toolcall_rel_name = toolcall_path.name
+        toolcall_sha256 = _sha256_file(toolcall_path)
+        toolcall_record_sha256 = tc_obj["toolcall_record_sha256"]
+
+
+    # ---- OPTIONAL: files sidecar (file attestation) ----
+    #
+    # Emits files_<call_id>.json and binds its hashes into the manifest entry.
+    #
+    files_rel_name: str | None = None
+    files_sha256: str | None = None
+    files_record_sha256: str | None = None
+
+    want_git_changed = bool(getattr(args, "attest_git_changed", False))
+    attest_paths = getattr(args, "attest_paths", None) or []
+    if want_git_changed or attest_paths:
+        try:
+            # base_dir:
+            # - git_changed => repo root (more stable)
+            # - path mode   => cwd (unless we can infer a git root cleanly)
+            if want_git_changed:
+                base_dir = _git_root()
+            else:
+                base_dir = Path.cwd().resolve()
+
+            roots: list[str] = []
+            file_list: list[Path] = []
+
+            if want_git_changed:
+                roots.append("git_changed")
+                file_list.extend(_collect_git_changed_files(base_dir))
+
+            for ap in attest_paths:
+                p = Path(ap).expanduser()
+                if not p.is_absolute():
+                    p = (Path.cwd() / p).resolve()
+                roots.append(_rel_or_abs(p, base_dir))
+                file_list.extend(_iter_files_under(p))
+
+            # de-dupe deterministically
+            seen = set()
+            uniq: list[Path] = []
+            for f in file_list:
+                rf = f.resolve()
+                if rf in seen:
+                    continue
+                seen.add(rf)
+                uniq.append(rf)
+            uniq.sort(key=lambda x: str(x))
+
+            files_obj: Dict[str, Any] = {
+                "mode": "git_changed" if want_git_changed and not attest_paths else ("mixed" if want_git_changed else "path"),
+                "base_dir": str(base_dir),
+                "roots": roots,
+                "files": [_file_record(f, base_dir) for f in uniq],
+            }
+            files_obj["files_record_sha256"] = _sha256_obj(
+                {
+                    "mode": files_obj["mode"],
+                    "base_dir": files_obj["base_dir"],
+                    "roots": files_obj["roots"],
+                    "files": files_obj["files"],
+                }
+            )
+
+            files_path = out_dir / f"files_{call_id}.json"
+            _write_json(files_path, files_obj)
+
+            files_rel_name = files_path.name
+            files_sha256 = _sha256_file(files_path)
+            files_record_sha256 = files_obj["files_record_sha256"]
+        except FileNotFoundError as e:
+            print(f"FAIL: file attestation path not found: {e}", file=sys.stderr)
+            return 2
+        except RuntimeError as e:
+            print(f"FAIL: file attestation error: {e}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print(f"FAIL: file attestation processing error: {e}", file=sys.stderr)
+            return 2
+
+
     # ---- NEW: run manifest ----
     import subprocess
 
@@ -859,6 +1144,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         "pubkey_sha256": _sha256_file(pubkey_path),
         "policy_sha256": policy_sha256,
     }
+
+    if toolcall_rel_name is not None:
+        entry["toolcall_path"] = toolcall_rel_name
+        entry["toolcall_sha256"] = toolcall_sha256
+        entry["toolcall_record_sha256"] = toolcall_record_sha256
+
+    if files_rel_name is not None:
+        entry["files_path"] = files_rel_name
+        entry["files_sha256"] = files_sha256
+        entry["files_record_sha256"] = files_record_sha256
 
     if manifest_path.exists():
         mj = _read_json(manifest_path)
@@ -1239,6 +1534,96 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
                     print(f"  got: {calc_record_sha}", file=sys.stderr)
                     return 2
 
+                # ---- OPTIONAL: files sidecar binding (file attestation) ----
+        files_rel = entry.get("files_path")
+        if files_rel is not None:
+            if not isinstance(files_rel, str) or not files_rel:
+                print(f"FAIL: receipts[{i}] files_path must be a non-empty string", file=sys.stderr)
+                return 2
+
+            expected_files_sha = entry.get("files_sha256")
+            if not isinstance(expected_files_sha, str) or not expected_files_sha:
+                print(f"FAIL: receipts[{i}] missing files_sha256", file=sys.stderr)
+                return 2
+
+            fp = _abs_from_manifest(files_rel)
+            if not fp.exists():
+                print("FAIL: files sidecar missing", file=sys.stderr)
+                print(f"  file: {fp}", file=sys.stderr)
+                return 2
+
+            actual_files_sha = _sha256_file(fp)
+            if actual_files_sha != expected_files_sha:
+                print("FAIL: files sidecar sha256 mismatch", file=sys.stderr)
+                print(f"  file: {fp}", file=sys.stderr)
+                print(f"  expected: {expected_files_sha}", file=sys.stderr)
+                print(f"  got: {actual_files_sha}", file=sys.stderr)
+                return 2
+
+            # Deep-verify files sidecar content (optional but recommended):
+            # - ensure required fields exist
+            # - verify files_record_sha256 binds (mode, base_dir, roots, files)
+            try:
+                fj = _read_json(fp)
+            except Exception as e:
+                print("FAIL: could not read files sidecar json", file=sys.stderr)
+                print(f"  file: {fp}", file=sys.stderr)
+                print(f"  error: {e}", file=sys.stderr)
+                return 2
+
+            mode = fj.get("mode")
+            base_dir = fj.get("base_dir")
+            roots = fj.get("roots")
+            files_list = fj.get("files")
+            if not isinstance(mode, str) or not mode:
+                print("FAIL: files sidecar missing mode", file=sys.stderr)
+                print(f"  file: {fp}", file=sys.stderr)
+                return 2
+            if not isinstance(base_dir, str) or not base_dir:
+                print("FAIL: files sidecar missing base_dir", file=sys.stderr)
+                print(f"  file: {fp}", file=sys.stderr)
+                return 2
+            if roots is not None and not isinstance(roots, list):
+                print("FAIL: files sidecar roots must be a list when present", file=sys.stderr)
+                print(f"  file: {fp}", file=sys.stderr)
+                return 2
+            if not isinstance(files_list, list):
+                print("FAIL: files sidecar missing files[]", file=sys.stderr)
+                print(f"  file: {fp}", file=sys.stderr)
+                return 2
+
+            # Basic schema checks per record
+            for j, r in enumerate(files_list):
+                if not isinstance(r, dict):
+                    print(f"FAIL: files sidecar files[{j}] not an object", file=sys.stderr)
+                    print(f"  file: {fp}", file=sys.stderr)
+                    return 2
+                pth = r.get("path")
+                sh = r.get("sha256")
+                if not isinstance(pth, str) or not pth:
+                    print(f"FAIL: files sidecar files[{j}] missing path", file=sys.stderr)
+                    print(f"  file: {fp}", file=sys.stderr)
+                    return 2
+                if not isinstance(sh, str) or not sh:
+                    print(f"FAIL: files sidecar files[{j}] missing sha256", file=sys.stderr)
+                    print(f"  file: {fp}", file=sys.stderr)
+                    return 2
+
+            calc_files_record = _sha256_obj({"mode": mode, "base_dir": base_dir, "roots": roots or [], "files": files_list})
+            expected_files_record = entry.get("files_record_sha256") or fj.get("files_record_sha256")
+            if expected_files_record is not None:
+                if not isinstance(expected_files_record, str) or not expected_files_record:
+                    print("FAIL: files_record_sha256 must be a non-empty string when present", file=sys.stderr)
+                    print(f"  file: {fp}", file=sys.stderr)
+                    return 2
+                if calc_files_record != expected_files_record:
+                    print("FAIL: files_record_sha256 mismatch", file=sys.stderr)
+                    print(f"  file: {fp}", file=sys.stderr)
+                    print(f"  expected: {expected_files_record}", file=sys.stderr)
+                    print(f"  got: {calc_files_record}", file=sys.stderr)
+                    return 2
+
+
 
         # policy binding per entry (optional unless policy-path supplied)
         if policy_sha256_expected is not None:
@@ -1424,6 +1809,38 @@ def main(argv: list[str] | None = None) -> int:
     )
     runp.add_argument("--call-id", default=None, help="Call id (default: auto-generated per invocation)")
     runp.add_argument("--policy-path", default=None, help="Path to policy file; binds sha256 into receipts+manifest")
+
+    # ---- Milestone 5: toolcall sidecar capture ----
+    # Simple mode: provide tool name  args/result payloads (file or inline JSON)
+    runp.add_argument("--tool", default=None, help="Optional tool name used by agent (e.g. 'web.search', 'db.query')")
+    runp.add_argument("--tool-args", dest="tool_args", default=None, help="Path to JSON file containing tool args")
+    runp.add_argument("--tool-args-json", dest="tool_args_json", default=None, help="Inline JSON string for tool args")
+    runp.add_argument("--tool-result", dest="tool_result", default=None, help="Path to JSON file containing tool result")
+    runp.add_argument("--tool-result-json", dest="tool_result_json", default=None, help="Inline JSON string for tool result")
+
+    # Advanced mode: provide a prebuilt toolcall JSON file containing {tool,args,result}
+    # If present, VACI will still write a stable toolcall_<call_id>.json into out_dir and bind it.
+    runp.add_argument(
+        "--toolcall-path",
+        dest="toolcall_path",
+        default=None,
+        help="Path to prebuilt toolcall JSON containing {tool,args,result} (advanced)",
+    )
+
+        # ---- Milestone 6: files sidecar capture (file attestation) ----
+    runp.add_argument(
+        "--attest-git-changed",
+        dest="attest_git_changed",
+        action="store_true",
+        help="Emit files_<call_id>.json for current git changed files (includes staged  unstaged).",
+    )
+    runp.add_argument(
+        "--attest-path",
+        dest="attest_paths",
+        action="append",
+        default=[],
+        help="Emit files_<call_id>.json for all files under PATH (repeatable).",
+    )
 
     runp.add_argument("command", nargs=argparse.REMAINDER, help="Command to execute (use: vaci run -- <cmd>)")
     runp.set_defaults(fn=cmd_run)

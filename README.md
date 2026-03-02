@@ -3,6 +3,7 @@
 VACI turns command execution into **cryptographically verifiable artifacts**.
 
 If your AI agent runs:
+
 - `pytest`
 - `pip install`
 - `terraform apply`
@@ -15,42 +16,66 @@ VACI produces:
 - 📜 A chained session manifest
 - 🧱 Policy-bound execution guarantees
 - 🛡️ Deterministic denial receipts
-- ✅ Verifiable CI artifacts
+- 📦 Portable verification bundles
+- 🔍 Toolcall attestation (args + results tamper detection)
+- 🧾 File attestation (changed files / artifact directories tamper detection)
 
-This is a minimal execution trust layer for AI agents.
+This is a minimal execution trust layer for AI agents and CI systems.
 
 ---
 
-## Why VACI Exists
+# Why VACI Exists
 
 LLM agents can:
-- call tools
-- run shell commands
-- modify repos
-- fetch network resources
+
+- Call tools
+- Execute shell commands
+- Modify repositories
+- Fetch network resources
+- Perform multi-step workflows
 
 But today, there is no cryptographic proof of:
 
-- what actually ran
-- under which policy
-- signed by which identity
-- in what order
-- whether something was denied
+- What actually ran
+- Under which policy
+- In what order
+- Signed by which identity
+- Whether something was denied
+- Whether tool inputs/outputs were modified
+- Whether repo/artifact files referenced by the agent were modified
 
 VACI provides that missing execution layer.
 
 It is:
 
-- Lightweight
 - Deterministic
 - CI-friendly
 - Agent-friendly
+- Cryptographically verifiable
+- Lightweight
 
 ---
 
+# 🧾 File Attestation (changed files / artifacts)
+
+You can optionally bind a **files sidecar** to each receipt entry:
+
+- `--attest-git-changed` records digests for currently changed files (staged  unstaged)
+- `--attest-path <PATH>` records digests for all files under a directory (repeatable)
+
+Example:
+
+```bash
+python -m vaci.cli run --policy-id demo --attest-git-changed -- pytest -q
+python -m vaci.cli run --policy-id demo --attest-path dist/ -- echo "built artifacts"
+python -m vaci.cli verify-manifest --manifest .vaci/run_manifest.json --trust .vaci/trusted_keys.json
+```
+
+This emits `files_<call_id>.json` and binds its sha256  record hash into the manifest entry.
+
 # 🚀 Quickstart (2 Minutes)
 
-Install:
+## Install
 
 ```bash
 pip install -e .

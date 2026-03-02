@@ -1,8 +1,29 @@
 name: VACI (verifiable agent CI)
 
 on:
-  push:
-  pull_request:
+  workflow_call:
+    inputs:
+      python_version:
+        type: string
+        default: "3.11"
+      policy_id:
+        type: string
+        default: "demo"
+      policy_path:
+        type: string
+        default: "demo/policy.json"
+      out_dir:
+        type: string
+        default: ".vaci"
+      require_finalized:
+        type: boolean
+        default: true
+      enforce_policy:
+        type: boolean
+        default: false
+    secrets:
+      VACI_GATEWAY_KEY_JSON:
+        required: false
 
 jobs:
   vaci:
@@ -17,7 +38,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ inputs.python_version }}
           cache: "pip"
 
       - name: Install
@@ -52,8 +73,9 @@ jobs:
           pub_raw = base64.urlsafe_b64decode(data["pubkey_b64"] + "==")
           key_id = hashlib.sha256(pub_raw).hexdigest()
 
-          Path(".vaci").mkdir(parents=True, exist_ok=True)
-          Path(".vaci/trusted_keys.json").write_text(
+          out_dir = Path("${{ inputs.out_dir }}")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          (out_dir / "trusted_keys.json").write_text(
               json.dumps({"trusted_key_ids":[key_id]}, indent=2, sort_keys=True),
               encoding="utf-8"
           )
@@ -62,50 +84,68 @@ jobs:
 
       - name: Run tests via VACI (produces receipts + manifest)
         run: |
-          rm -rf .vaci
-          mkdir -p .vaci
+          rm -rf "${{ inputs.out_dir }}"
+          mkdir -p "${{ inputs.out_dir }}"
 
           RID="ci_${{ github.run_id }}_${{ github.run_attempt }}"
 
           python -m vaci.cli run \
-            --out-dir .vaci \
+            --out-dir "${{ inputs.out_dir }}" \
             --keyfile .vaci_keys/gateway_ed25519.key \
             --run-id "$RID" \
-            --policy-id demo \
-            --policy-path demo/policy.json \
+            --policy-id "${{ inputs.policy_id }}" \
+            --policy-path "${{ inputs.policy_path }}" \
             -- echo "hello from CI"
 
           python -m vaci.cli run \
-            --out-dir .vaci \
+            --out-dir "${{ inputs.out_dir }}" \
             --keyfile .vaci_keys/gateway_ed25519.key \
             --run-id "$RID" \
-            --policy-id demo \
-            --policy-path demo/policy.json \
+            --policy-id "${{ inputs.policy_id }}" \
+            --policy-path "${{ inputs.policy_path }}" \
             -- pytest -q
 
       - name: Verify latest receipt (sanity check)
         run: |
           python -m vaci.cli verify \
-            --receipt .vaci/receipt.json \
-            --pubkey .vaci/public_key_b64.json \
-            --trust .vaci/trusted_keys.json
+            --receipt "${{ inputs.out_dir }}/receipt.json" \
+            --pubkey "${{ inputs.out_dir }}/public_key_b64.json" \
+            --trust "${{ inputs.out_dir }}/trusted_keys.json"
 
       - name: Finalize manifest
+        if: ${{ inputs.require_finalized }}
         run: |
           python -m vaci.cli finalize \
-            --manifest .vaci/run_manifest.json \
+            --manifest "${{ inputs.out_dir }}/run_manifest.json" \
             --keyfile .vaci_keys/gateway_ed25519.key
 
-      - name: Verify manifest (must be finalized + policy-bound)
+      - name: Verify manifest
         run: |
+          ARGS=""
+          if [ "${{ inputs.require_finalized }}" = "true" ]; then
+            ARGS="$ARGS --require-finalized"
+          fi
+          if [ "${{ inputs.enforce_policy }}" = "true" ]; then
+            ARGS="$ARGS --enforce-policy"
+          fi
+
           python -m vaci.cli verify-manifest \
-            --manifest .vaci/run_manifest.json \
-            --trust .vaci/trusted_keys.json \
-            --require-finalized \
-            --policy-path demo/policy.json
+            --manifest "${{ inputs.out_dir }}/run_manifest.json" \
+            --trust "${{ inputs.out_dir }}/trusted_keys.json" \
+            --policy-path "${{ inputs.policy_path }}" \
+            $ARGS
+
+      - name: Create portable bundle
+        run: |
+          python -m vaci.cli bundle \
+            --manifest "${{ inputs.out_dir }}/run_manifest.json" \
+            --out "${{ inputs.out_dir }}/run_bundle.tgz" \
+            --policy-path "${{ inputs.policy_path }}"
 
       - name: Upload VACI artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vaci-artifacts
-          path: .vaci
+          path: |
+            ${{ inputs.out_dir }}
+            .vaci_keys/gateway_ed25519.key
