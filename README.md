@@ -1,5 +1,9 @@
 # VACI — Verifiable Agent Continuous Integration
 
+![CI](https://github.com/vikasKumar2411/verifiable-agent-ci/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+
 **VACI** is a cryptographic execution harness for AI agents and CI systems.
 
 It turns command and tool execution into tamper-evident, cryptographically verifiable artifacts.
