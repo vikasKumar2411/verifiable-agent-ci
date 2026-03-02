@@ -87,6 +87,47 @@ But today there is typically **no cryptographic proof** of:
 
 ---
 
+## Architecture
+```
+┌─────────────────────────────────────────────┐
+│                    Agent                    │
+│        (LLM / CI runner / automation)       │
+└───────────────────┬─────────────────────────┘
+                    │  command / tool call
+                    ▼
+┌─────────────────────────────────────────────┐
+│             VACI Gateway                    │
+│   • applies policy (allow / deny)           │
+│   • signs execution with Ed25519 key        │
+│   • captures stdout/stderr digests          │
+└───────────────────┬─────────────────────────┘
+                    │  signed artifact
+                    ▼
+┌─────────────────────────────────────────────┐
+│               Receipt                       │
+│   run_id · call_id · command · timestamps   │
+│   exit code · output digests · policy_sha   │
+└───────────────────┬─────────────────────────┘
+                    │  chained via prev_entry_hash
+                    ▼
+┌─────────────────────────────────────────────┐
+│           Manifest (hash chain)             │
+│   receipt₁ → receipt₂ → receipt₃ → …       │
+│   reorder or delete = broken chain          │
+└───────────────────┬─────────────────────────┘
+                    │  verify-manifest / verify-bundle
+                    ▼
+┌─────────────────────────────────────────────┐
+│           Verifier (trust root)             │
+│   • validates signatures                    │
+│   • enforces chain integrity                │
+│   • checks policy compliance               │
+│   • confirms sidecar hashes                 │
+└─────────────────────────────────────────────┘
+```
+
+---
+
 ## Core Guarantees
 
 ### 🔐 Signed Receipts
