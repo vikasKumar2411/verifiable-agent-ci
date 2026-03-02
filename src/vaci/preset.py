@@ -13,6 +13,14 @@ except Exception:  # pragma: no cover
 
 PRESET_PACKAGE = "vaci.presets"
 
+# Keep a stable tutorial-friendly alias. Canonical preset stays "pr-agent".
+_PRESET_ALIASES: Dict[str, str] = {
+    "demo": "pr-agent",
+}
+
+def _resolve_preset_name(name: str) -> str:
+    return _PRESET_ALIASES.get(name, name)
+
 
 def list_presets() -> List[str]:
     """
@@ -30,11 +38,13 @@ def load_preset(name: str) -> Dict:
     """
     Loads a preset JSON from vaci.presets/<name>.json and returns the parsed dict.
     """
-    filename = f"{name}.json"
+    resolved = _resolve_preset_name(name)
+    filename = f"{resolved}.json"
     root = importlib_resources.files(PRESET_PACKAGE)
     path = root / filename
     if not path.is_file():
         available = ", ".join(list_presets()) or "(none)"
+        # show the original user-supplied name in the error
         raise FileNotFoundError(f"Unknown preset '{name}'. Available: {available}")
     raw = path.read_text(encoding="utf-8")
     return json.loads(raw)

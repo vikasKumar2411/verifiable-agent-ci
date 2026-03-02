@@ -210,10 +210,48 @@ def _choose_demo_dir(base: str = ".vaci/demo_runs") -> Path:
     run_id = f"demo_{_safe_timestamp()}_{os.getpid()}"
     return base_dir / run_id
 
+def _demo_print_last_receipt_summary(demo_dir: Path) -> None:
+    """
+    Print a short, human-friendly summary based on demo_dir/receipt.json.
+    This makes demo output understandable without opening JSON manually.
+    """
+    try:
+        rj = _read_json(demo_dir / "receipt.json")
+    except Exception:
+        return
+
+    decision = rj.get("policy_decision", "allow")
+    cmd = rj.get("command", [])
+    call_id = rj.get("call_id")
+    exit_code = rj.get("exit_code")
+    deny_reason = rj.get("deny_reason")
+
+    # keep it concise / screenshot-friendly
+    if decision == "deny":
+        msg = f"DENY  call_id={call_id} exit={exit_code} cmd={cmd} reason={deny_reason}"
+    else:
+        msg = f"ALLOW call_id={call_id} exit={exit_code} cmd={cmd}"
+
+    print(msg, file=sys.stderr)
+
+def _write_demo_forbidden_exe(demo_dir: Path) -> Path:
+    """
+    Create a deterministic "forbidden" executable in the demo directory.
+    Policy should deny it consistently because it's not on any allowlist.
+    """
+    p = demo_dir / "vaci_forbidden_demo.sh"
+    p.write_text("#!/bin/sh\necho forbidden-demo\n", encoding="utf-8")
+    try:
+        os.chmod(p, 0o755)
+    except Exception:
+        pass
+    return p
+
 def cmd_init(args: argparse.Namespace) -> int:
     """
     Initialize a repo-local VACI policy file from a built-in preset.
     """
+    strict_pass = bool(getattr(args, "strict_pass", False))
     preset = args.preset
     out_path = Path(args.out).expanduser()
     if not out_path.is_absolute():
@@ -255,7 +293,7 @@ def cmd_demo(args: argparse.Namespace) -> int:
       - one denied command
       - finalize  verify manifest
     """
-
+    strict_pass = bool(getattr(args, "strict_pass", False))
     preset = args.preset
     try:
         _ = load_preset(preset)  # validate preset exists early
@@ -329,35 +367,37 @@ def cmd_demo(args: argparse.Namespace) -> int:
     if rc != 0:
         print("FAIL: allowed run failed", file=sys.stderr)
         return rc
+    if args.verbose:
+        _demo_print_last_receipt_summary(demo_dir)
+    
+    # 4) denied command (deterministic)
+    # If --strict-pass, skip the denied step so enforce-policy can pass.
+    if not strict_pass:
+        forbidden = _write_demo_forbidden_exe(demo_dir)
+        deny_cmd = [str(forbidden)]
+        rc = _run_cli(
+            [
+                "run",
+                "--out-dir",
+                str(demo_dir),
+                "--keyfile",
+                str(keyfile),
+                "--run-id",
+                run_id,
+                "--policy-id",
+                preset,
+                "--policy-path",
+                str(policy_path),
+                "--",
+            ] + deny_cmd
+        )
+        # cmd_run returns 0 even for denied receipts (it records the denial). Nonzero is unexpected.
+        if rc != 0:
+            print("FAIL: denied run failed unexpectedly (expected policy denial receipt)", file=sys.stderr)
+            return rc
+        if args.verbose:
+            _demo_print_last_receipt_summary(demo_dir)
 
-    # 4) denied command (curl) - if curl is missing on the system, fall back to wget.
-    deny_cmd = ["curl", "--version"]
-    try:
-        subprocess.check_output(["which", "curl"], text=True).strip()
-    except Exception:
-        deny_cmd = ["wget", "--version"]
-
-    rc = _run_cli(
-        [
-            "run",
-            "--out-dir",
-            str(demo_dir),
-            "--keyfile",
-            str(keyfile),
-            "--run-id",
-            run_id,
-            "--policy-id",
-            preset,
-            "--policy-path",
-            str(policy_path),
-            "--",
-        ] +
-         deny_cmd
-    )
-    # If policy works, cmd_run returns 0 (it records a denied receipt). Any nonzero is unexpected.
-    if rc != 0:
-        print("FAIL: denied run failed unexpectedly (expected policy denial receipt)", file=sys.stderr)
-        return rc
 
     # 5) finalize manifest
     rc = _run_cli(["finalize", "--manifest", str(manifest), "--keyfile", str(keyfile)])
@@ -371,6 +411,24 @@ def cmd_demo(args: argparse.Namespace) -> int:
         print("FAIL: verify-manifest failed", file=sys.stderr)
         return rc
 
+    # 6b) strict verify (optional): only runs cleanly if strict_pass==True
+    if strict_pass:
+        rc = _run_cli(
+            [
+                "verify-manifest",
+                "--manifest",
+                str(manifest),
+                "--trust",
+                str(trust),
+                "--policy-path",
+                str(policy_path),
+                "--enforce-policy",
+            ]
+        )
+        if rc != 0:
+            print("FAIL: strict verify-manifest --enforce-policy failed", file=sys.stderr)
+            return rc
+
     # 7) summary
     print("\n✅ VACI demo completed", file=sys.stderr)
     print(f"  preset:   {preset}", file=sys.stderr)
@@ -378,6 +436,10 @@ def cmd_demo(args: argparse.Namespace) -> int:
     print(f"  out_dir:  {demo_dir}", file=sys.stderr)
     print(f"  manifest: {manifest}", file=sys.stderr)
     print(f"  trust:    {trust}", file=sys.stderr)
+    if strict_pass:
+        print("  mode:     strict-pass (no denied receipts; enforce-policy OK)", file=sys.stderr)
+    else:
+        print("  mode:     standard (includes denied receipt; enforce-policy fails as expected)", file=sys.stderr)
     print("\nNext ideas:", file=sys.stderr)
     print(f"  vaci verify-manifest --manifest {manifest} --trust {trust}", file=sys.stderr)
     print(f"  ls -la {demo_dir}", file=sys.stderr)
@@ -499,6 +561,7 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     files: list[Path] = []
     files.append(manifest_path)
 
+    files_sidecars: list[Path] = []
     # referenced artifacts
     for i, e in enumerate(receipts):
         if not isinstance(e, dict):
@@ -529,14 +592,17 @@ def cmd_bundle(args: argparse.Namespace) -> int:
                 return 2
             files.append(tp)
 
-    # optional files sidecar
-    fp_rel = e.get("files_path")
-    if fp_rel is not None:
-        fp = _abs_from_manifest(fp_rel)
-        if not fp.exists():
-            print(f"FAIL: manifest references missing files sidecar: {fp}", file=sys.stderr)
-            return 2
-        files.append(fp)
+        # optional files sidecar (per-entry)
+        fp_rel = e.get("files_path")
+        if fp_rel is not None:
+            if not isinstance(fp_rel, str) or not fp_rel:
+                print(f"FAIL: receipts[{i}] files_path must be a non-empty string", file=sys.stderr)
+                return 2
+            fp = _abs_from_manifest(fp_rel)
+            if not fp.exists():
+                print(f"FAIL: manifest references missing files sidecar: {fp}", file=sys.stderr)
+                return 2
+            files_sidecars.append(fp)
 
     # Optional policy inclusion:
     # - if user passes --policy-path, include that file as "policy.json" in the bundle
@@ -558,6 +624,13 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     uniq: list[Path] = []
     seen = set()
     for f in files:
+        rf = f.resolve()
+        if rf not in seen:
+            seen.add(rf)
+            uniq.append(rf)
+
+    # add files sidecars (deduped)
+    for f in files_sidecars:
         rf = f.resolve()
         if rf not in seen:
             seen.add(rf)
@@ -869,6 +942,9 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         return 2
 
     mj = _read_json(manifest_path)
+
+    # NOTE: cmd_verify_manifest is intentionally conservative and rejects malformed manifests early.
+
     payload = _manifest_payload_from_signed(mj)
 
     if payload.get("finalized") is True:
@@ -1312,7 +1388,11 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     # IMPORTANT: vaci.crypto.verify_obj_ed25519 expects raw pubkey bytes (not a cryptography key object)
     pubkey = pubkey_raw
 
-    # -------- Variant-B only --------
+    signer_key_id = hashlib.sha256(pubkey_raw).hexdigest()
+    # Bind "manifest signer" pubkey file hash so we can enforce signer-consistency across entries
+    signer_pubkey_file_sha256 = _sha256_file(pubkey_path)
+
+    # -------- Variant-B only (manifest_hash MUST be Variant-B) --------
     payload_b = dict(mj)
     payload_b.pop("signature", None)
     payload_b.pop("manifest_hash", None)
@@ -1323,7 +1403,10 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
         print("FAIL: manifest_hash mismatch (expected Variant-B)", file=sys.stderr)
         return 2
 
-    payload_for_sig = payload_b
+    # -------- signature verification: accept Variant-B OR Variant-A --------
+    # Some signers sign Variant-A (exclude signature only), while manifest_hash is Variant-B.
+    payload_a = dict(mj)
+    payload_a.pop("signature", None)
 
     # -------- signature check --------
     try:
@@ -1332,12 +1415,13 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
         print(f"FAIL: invalid manifest signature object: {e}", file=sys.stderr)
         return 2
 
-    if not verify_obj_ed25519(pubkey, payload_for_sig, sig):
+    ok_b = verify_obj_ed25519(pubkey, payload_b, sig)
+    ok_a = verify_obj_ed25519(pubkey, payload_a, sig)
+    if not (ok_b or ok_a):
         print("FAIL: manifest signature verification failed", file=sys.stderr)
         return 2
 
     # -------- trust root check for signer (enforce allowlist here) --------
-    signer_key_id = hashlib.sha256(pubkey_raw).hexdigest()
 
     trust_path = Path(args.trust).expanduser()
     if not trust_path.is_absolute():
@@ -1389,6 +1473,53 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     if policy_id is not None and not isinstance(policy_id, str):
         print("FAIL: manifest policy_id must be a string if present", file=sys.stderr)
         return 2
+
+    # -------- strict invariants: duplicates / time monotonicity / signer consistency --------
+    #
+    # 1) Reject duplicate call_id (prevents sidecar/receipt reuse / splice attempts)
+    # 2) Enforce created_at_ms monotonic non-decreasing (prevents reorder games with valid chains)
+    # 3) Enforce single signer across entries (prevents mixed-signer manifests)
+    #
+    seen_call_ids: set[str] = set()
+    prev_ts: int | None = None
+    for i, e in enumerate(receipts):
+        if not isinstance(e, dict):
+            print(f"FAIL: receipts[{i}] is not an object", file=sys.stderr)
+            return 2
+
+        cid = e.get("call_id")
+        if not isinstance(cid, str) or not cid:
+            print(f"FAIL: receipts[{i}] missing call_id", file=sys.stderr)
+            return 2
+        if cid in seen_call_ids:
+            print(f"FAIL: duplicate call_id in receipts[]: {cid}", file=sys.stderr)
+            return 2
+        seen_call_ids.add(cid)
+
+        ts = e.get("created_at_ms")
+        if not isinstance(ts, int):
+            print(f"FAIL: receipts[{i}] created_at_ms must be an int", file=sys.stderr)
+            return 2
+        if prev_ts is not None and ts < prev_ts:
+            print("FAIL: receipts[] created_at_ms is not monotonic non-decreasing", file=sys.stderr)
+            print(f"  index {i-1} ts={prev_ts}", file=sys.stderr)
+            print(f"  index {i}   ts={ts}", file=sys.stderr)
+            return 2
+        prev_ts = ts
+
+        # signer consistency: require each entry binds the same pubkey_sha256 as manifest signer pubkey file
+        psha = e.get("pubkey_sha256")
+        if not isinstance(psha, str) or not psha:
+            print(f"FAIL: receipts[{i}] missing pubkey_sha256", file=sys.stderr)
+            return 2
+        if psha != signer_pubkey_file_sha256:
+            print("FAIL: mixed-signer manifest (pubkey_sha256 mismatch vs signer pubkey)", file=sys.stderr)
+            print(f"  index:   {i}", file=sys.stderr)
+            print(f"  call_id: {cid}", file=sys.stderr)
+            print(f"  expected pubkey_sha256: {signer_pubkey_file_sha256}", file=sys.stderr)
+            print(f"  got      pubkey_sha256: {psha}", file=sys.stderr)
+            return 2
+
 
     # -------- verify receipt entry chain (reorder/delete detection) --------
     prev = None
@@ -1917,6 +2048,12 @@ def main(argv: list[str] | None = None) -> int:
         "--policy-path",
         default=None,
         help="Optional policy file path (default: writes preset policy into demo dir)",
+    )
+    demop.add_argument(
+        "--strict-pass",
+        dest="strict_pass",
+        action="store_true",
+        help="Skip the denied step and also run verify-manifest --enforce-policy (should pass).",
     )
     demop.add_argument("--verbose", action="store_true", help="Print subcommands as they run")
     demop.set_defaults(fn=cmd_demo)

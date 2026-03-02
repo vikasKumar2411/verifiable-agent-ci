@@ -54,6 +54,25 @@ It is:
 - Cryptographically verifiable
 - Lightweight
 
+# Manifest Verification Invariants
+
+When you run:
+
+```bash
+python -m vaci.cli verify-manifest --manifest .vaci/run_manifest.json --trust .vaci/trusted_keys.json
+```
+
+VACI verifies:
+
+- The manifest signature  manifest hash (tamper detection)
+- The receipt chain (`prev_entry_hash` → `entry_hash`) to detect reorder/delete
+- All referenced files match their recorded sha256 (receipts, pubkeys, sidecars)
+
+Additionally, VACI enforces these **strict invariants**:
+
+- **No duplicate `call_id`** in `receipts[]`
+- **Monotonic `created_at_ms`** across `receipts[]` (non-decreasing)
+- **Single signer** across all entries (prevents mixed-signer manifests)
 ---
 
 # 🧾 File Attestation (changed files / artifacts)
@@ -72,6 +91,7 @@ python -m vaci.cli verify-manifest --manifest .vaci/run_manifest.json --trust .v
 ```
 
 This emits `files_<call_id>.json` and binds its sha256  record hash into the manifest entry.
+
 
 # 🚀 Quickstart (2 Minutes)
 
