@@ -11,3 +11,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+.vaci/
+.vaci_keys/
+**/__pycache__/
+*.pyc
+src/vaci.egg-info/
+demo_out*/
+demo/
+policy.json
+

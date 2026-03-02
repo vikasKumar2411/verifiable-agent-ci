@@ -1,11 +1,14 @@
 # /Users/vikaskumar/Desktop/verifiable-agent-ci/src/vaci/cli.py
 from __future__ import annotations
 
+import subprocess
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -13,6 +16,7 @@ from typing import Any, Dict
 
 from vaci.trust import TrustError, assert_trusted_signer, key_id_from_receipt_json
 from vaci.gateway import LocalGateway, Receipt, verify_receipt, sign_manifest
+from vaci.presets import PresetNotFoundError, list_presets, load_preset
 
 def _write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -21,6 +25,459 @@ def _write_json(path: Path, obj: Any) -> None:
 
 def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+def _ensure_gitignore_has_vaci(gitignore_path: Path) -> None:
+    """
+    Add ".vaci/" to .gitignore if missing (idempotent).
+    """
+    line = ".vaci/"
+    if gitignore_path.exists():
+        txt = gitignore_path.read_text(encoding="utf-8")
+        lines = [l.strip() for l in txt.splitlines()]
+        if line in lines:
+            return
+        # append with newline
+        if not txt.endswith("\n"):
+            txt = "\n"
+        txt += line + "\n"
+        gitignore_path.write_text(txt, encoding="utf-8")
+    else:
+        gitignore_path.write_text(line + "\n", encoding="utf-8")
+
+def _safe_timestamp() -> str:
+    # filesystem-friendly timestamp
+    return datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+def _choose_demo_dir(base: str = ".vaci/demo_runs") -> Path:
+    base_dir = Path(base).expanduser()
+    if not base_dir.is_absolute():
+        base_dir = (Path.cwd() / base_dir).resolve()
+    run_id = f"demo_{_safe_timestamp()}_{os.getpid()}"
+    return base_dir / run_id
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """
+    Initialize a repo-local VACI policy file from a built-in preset.
+    """
+    preset = args.preset
+    out_path = Path(args.out).expanduser()
+    if not out_path.is_absolute():
+        out_path = (Path.cwd() / out_path).resolve()
+
+    try:
+        policy_obj = load_preset(preset)
+    except PresetNotFoundError as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"FAIL: could not load preset '{preset}': {e}", file=sys.stderr)
+        return 2
+
+    if out_path.exists() and not args.force:
+        print(f"FAIL: policy already exists: {out_path}", file=sys.stderr)
+        print("Hint: re-run with --force to overwrite.", file=sys.stderr)
+        return 2
+
+    _write_json(out_path, policy_obj)
+    print(f"OK: wrote policy preset '{preset}' to {out_path}", file=sys.stderr)
+
+    if getattr(args, "gitignore", False):
+        gi = Path(args.gitignore_path or ".gitignore").expanduser()
+        if not gi.is_absolute():
+            gi = (Path.cwd() / gi).resolve()
+        _ensure_gitignore_has_vaci(gi)
+        print(f"OK: updated .gitignore: {gi}", file=sys.stderr)
+
+    print("\nNext:", file=sys.stderr)
+    print(f"  vaci demo --preset {preset}", file=sys.stderr)
+    return 0
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    """
+    Run a deterministic end-to-end demo:
+      - keygen  trust add in a fresh demo run dir
+      - one allowed command
+      - one denied command
+      - finalize  verify manifest
+    """
+
+    preset = args.preset
+    try:
+        _ = load_preset(preset)  # validate preset exists early
+    except PresetNotFoundError as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"FAIL: could not load preset '{preset}': {e}", file=sys.stderr)
+        return 2
+
+    demo_dir = Path(args.out_dir).expanduser() if args.out_dir else _choose_demo_dir()
+    if not demo_dir.is_absolute():
+        demo_dir = (Path.cwd() / demo_dir).resolve()
+    demo_dir.mkdir(parents=True, exist_ok=True)
+
+    keyfile = demo_dir / "gateway_ed25519.key"
+    pubkey = demo_dir / "public_key_b64.json"
+    trust = demo_dir / "trusted_keys.json"
+    manifest = demo_dir / "run_manifest.json"
+
+    # We want an explicit run_id so cmd_run can append safely.
+    run_id = args.run_id or demo_dir.name
+
+    # Ensure policy file exists at expected path; if missing, write it into demo_dir
+    # (demo should be self-contained).
+    policy_path = Path(args.policy_path).expanduser() if args.policy_path else (demo_dir / "policy.json")
+    if not policy_path.is_absolute():
+        policy_path = (Path.cwd() / policy_path).resolve()
+    if not policy_path.exists():
+        policy_obj = load_preset(preset)
+        _write_json(policy_path, policy_obj)
+
+    def _run_cli(argv: list[str]) -> int:
+        # Call via python -m vaci.cli to avoid relying on console_script resolution.
+        cmd = [sys.executable, "-m", "vaci.cli"] + argv
+        if args.verbose:
+            print("RUN:", " ".join(cmd), file=sys.stderr)
+        return subprocess.call(cmd)
+
+    # 1) keygen
+    rc = _run_cli(["keygen", "--out", str(demo_dir)])
+    if rc != 0:
+        print("FAIL: keygen failed", file=sys.stderr)
+        return rc
+
+    # 2) trust add
+    rc = _run_cli(["trust", "add", "--pubkey", str(pubkey), "--trust", str(trust)])
+    if rc != 0:
+        print("FAIL: trust add failed", file=sys.stderr)
+        return rc
+
+    # 3) allowed command (echo)
+    rc = _run_cli(
+        [
+            "run",
+            "--out-dir",
+            str(demo_dir),
+            "--keyfile",
+            str(keyfile),
+            "--run-id",
+            run_id,
+            "--policy-id",
+            preset,
+            "--policy-path",
+            str(policy_path),
+            "--",
+            "echo",
+            "hello",
+        ]
+    )
+    if rc != 0:
+        print("FAIL: allowed run failed", file=sys.stderr)
+        return rc
+
+    # 4) denied command (curl) - if curl is missing on the system, fall back to wget.
+    deny_cmd = ["curl", "--version"]
+    try:
+        subprocess.check_output(["which", "curl"], text=True).strip()
+    except Exception:
+        deny_cmd = ["wget", "--version"]
+
+    rc = _run_cli(
+        [
+            "run",
+            "--out-dir",
+            str(demo_dir),
+            "--keyfile",
+            str(keyfile),
+            "--run-id",
+            run_id,
+            "--policy-id",
+            preset,
+            "--policy-path",
+            str(policy_path),
+            "--",
+        ] +
+         deny_cmd
+    )
+    # If policy works, cmd_run returns 0 (it records a denied receipt). Any nonzero is unexpected.
+    if rc != 0:
+        print("FAIL: denied run failed unexpectedly (expected policy denial receipt)", file=sys.stderr)
+        return rc
+
+    # 5) finalize manifest
+    rc = _run_cli(["finalize", "--manifest", str(manifest), "--keyfile", str(keyfile)])
+    if rc != 0:
+        print("FAIL: finalize failed", file=sys.stderr)
+        return rc
+
+    # 6) verify manifest (default: crypto + hashes + trust + integrity; policy binding check is OK)
+    rc = _run_cli(["verify-manifest", "--manifest", str(manifest), "--trust", str(trust), "--policy-path", str(policy_path)])
+    if rc != 0:
+        print("FAIL: verify-manifest failed", file=sys.stderr)
+        return rc
+
+    # 7) summary
+    print("\n✅ VACI demo completed", file=sys.stderr)
+    print(f"  preset:   {preset}", file=sys.stderr)
+    print(f"  run_id:   {run_id}", file=sys.stderr)
+    print(f"  out_dir:  {demo_dir}", file=sys.stderr)
+    print(f"  manifest: {manifest}", file=sys.stderr)
+    print(f"  trust:    {trust}", file=sys.stderr)
+    print("\nNext ideas:", file=sys.stderr)
+    print(f"  vaci verify-manifest --manifest {manifest} --trust {trust}", file=sys.stderr)
+    print(f"  ls -la {demo_dir}", file=sys.stderr)
+    return 0
+
+def cmd_session(args: argparse.Namespace) -> int:
+    """
+    Create a reusable VACI session directory and print env exports.
+
+    Creates:
+      - <out_dir>/gateway_ed25519.key
+      - <out_dir>/public_key_b64.json
+      - <out_dir>/trusted_keys.json (includes generated key_id)
+      - <out_dir>/policy.json (from preset)
+
+    Prints (stdout; safe for eval):
+      export VACI_OUT_DIR=...
+      export VACI_KEYFILE=...
+      export VACI_POLICY_PATH=...
+      export VACI_POLICY_ID=...
+      export VACI_RUN_ID=...
+      export VACI_TRUST=...
+    """
+    import subprocess
+    import uuid
+
+    preset = args.preset
+    try:
+        policy_obj = load_preset(preset)
+    except PresetNotFoundError as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"FAIL: could not load preset '{preset}': {e}", file=sys.stderr)
+        return 2
+
+    run_id = args.run_id or f"session_{_safe_timestamp()}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+
+    base = Path(args.base_dir or ".vaci/sessions").expanduser()
+    if not base.is_absolute():
+        base = (Path.cwd() / base).resolve()
+
+    out_dir = base / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    keyfile = out_dir / "gateway_ed25519.key"
+    pubkey = out_dir / "public_key_b64.json"
+    trust = out_dir / "trusted_keys.json"
+    policy_path = out_dir / "policy.json"
+
+    # Write policy
+    _write_json(policy_path, policy_obj)
+
+    # keygen
+    rc = subprocess.call([sys.executable, "-m", "vaci.cli", "keygen", "--out", str(out_dir)])
+    if rc != 0:
+        print("FAIL: keygen failed", file=sys.stderr)
+        return rc
+
+    # trust add
+    rc = subprocess.call(
+        [sys.executable, "-m", "vaci.cli", "trust", "add", "--pubkey", str(pubkey), "--trust", str(trust)]
+    )
+    if rc != 0:
+        print("FAIL: trust add failed", file=sys.stderr)
+        return rc
+
+    # Print shell exports (stdout; so eval "$( ... )" works)
+    print(f"export VACI_OUT_DIR={shlex.quote(str(out_dir))}")
+    print(f"export VACI_KEYFILE={shlex.quote(str(keyfile))}")
+    print(f"export VACI_POLICY_PATH={shlex.quote(str(policy_path))}")
+    print(f"export VACI_POLICY_ID={shlex.quote(str(preset))}")
+    print(f"export VACI_RUN_ID={shlex.quote(str(run_id))}")
+    print(f"export VACI_TRUST={shlex.quote(str(trust))}")
+
+    if getattr(args, "print_hint", False):
+        print("", file=sys.stderr)
+        print("Next:", file=sys.stderr)
+        print(f'  eval "$(vaci session --preset {preset})"', file=sys.stderr)
+        print("  vaci run -- echo hello", file=sys.stderr)
+
+    return 0
+
+def cmd_bundle(args: argparse.Namespace) -> int:
+    """
+    Create a portable bundle (.tgz) containing:
+      - run_manifest.json (signed)
+      - all referenced receipt/pubkey files in receipts[]
+      - optional toolcall sidecars (if referenced)
+      - optional policy.json (if adjacent to manifest or explicitly provided)
+    """
+    import tarfile
+
+    manifest_path = Path(args.manifest).expanduser()
+    if not manifest_path.is_absolute():
+        manifest_path = (Path.cwd() / manifest_path).resolve()
+
+    if not manifest_path.exists():
+        print(f"FAIL: manifest not found: {manifest_path}", file=sys.stderr)
+        return 2
+
+    out_path = Path(args.out).expanduser()
+    if not out_path.is_absolute():
+        out_path = (Path.cwd() / out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mj = _read_json(manifest_path)
+    receipts = mj.get("receipts") or []
+    if not isinstance(receipts, list) or not receipts:
+        print("FAIL: manifest missing receipts[]", file=sys.stderr)
+        return 2
+
+    def _abs_from_manifest(rel_or_abs: str) -> Path:
+        p = Path(rel_or_abs)
+        if p.is_absolute():
+            return p
+        return (manifest_path.parent / p).resolve()
+
+    files: list[Path] = []
+    files.append(manifest_path)
+
+    # referenced artifacts
+    for i, e in enumerate(receipts):
+        if not isinstance(e, dict):
+            print(f"FAIL: receipts[{i}] is not an object", file=sys.stderr)
+            return 2
+
+        for k in ("receipt_path", "pubkey_path"):
+            if k not in e:
+                print(f"FAIL: receipts[{i}] missing {k}", file=sys.stderr)
+                return 2
+
+        rp = _abs_from_manifest(e["receipt_path"])
+        pp = _abs_from_manifest(e["pubkey_path"])
+        if not rp.exists():
+            print(f"FAIL: missing receipt file: {rp}", file=sys.stderr)
+            return 2
+        if not pp.exists():
+            print(f"FAIL: missing pubkey file: {pp}", file=sys.stderr)
+            return 2
+        files.extend([rp, pp])
+
+        # optional toolcall sidecar
+        tc = e.get("toolcall_path")
+        if tc is not None:
+            tp = _abs_from_manifest(tc)
+            if not tp.exists():
+                print(f"FAIL: manifest references missing toolcall file: {tp}", file=sys.stderr)
+                return 2
+            files.append(tp)
+
+    # Optional policy inclusion:
+    # - if user passes --policy-path, include that file as "policy.json" in the bundle
+    # - else, if a sibling policy.json exists next to the manifest, include it
+    policy_src = None
+    if getattr(args, "policy_path", None):
+        policy_src = Path(args.policy_path).expanduser()
+        if not policy_src.is_absolute():
+            policy_src = (Path.cwd() / policy_src).resolve()
+        if not policy_src.exists():
+            print(f"FAIL: policy file not found: {policy_src}", file=sys.stderr)
+            return 2
+    else:
+        sibling = (manifest_path.parent / "policy.json")
+        if sibling.exists():
+            policy_src = sibling.resolve()
+
+    # De-dupe by resolved absolute path
+    uniq: list[Path] = []
+    seen = set()
+    for f in files:
+        rf = f.resolve()
+        if rf not in seen:
+            seen.add(rf)
+            uniq.append(rf)
+
+    # Write tar.gz with stable, top-level names
+    try:
+        with tarfile.open(out_path, "w:gz") as tf:
+            # Always write manifest as run_manifest.json at root
+            tf.add(manifest_path, arcname="run_manifest.json")
+
+            # Add referenced artifacts using their basenames (unique by call_id)
+            for f in uniq:
+                if f == manifest_path:
+                    continue
+                tf.add(f, arcname=f.name)
+
+            # Add policy as policy.json (optional)
+            if policy_src is not None:
+                tf.add(policy_src, arcname="policy.json")
+    except Exception as e:
+        print(f"FAIL: could not write bundle: {e}", file=sys.stderr)
+        return 2
+
+    print(f"OK: wrote bundle: {out_path}", file=sys.stderr)
+    return 0
+
+
+def cmd_verify_bundle(args: argparse.Namespace) -> int:
+    """
+    Verify a portable bundle:
+      - extracts to a temp dir
+      - runs verify-manifest on extracted run_manifest.json
+    """
+    import tarfile
+    import tempfile
+
+    bundle_path = Path(args.bundle).expanduser()
+    if not bundle_path.is_absolute():
+        bundle_path = (Path.cwd() / bundle_path).resolve()
+
+    if not bundle_path.exists():
+        print(f"FAIL: bundle not found: {bundle_path}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="vaci_bundle_") as td:
+        out_dir = Path(td)
+
+        # Extract
+        try:
+            with tarfile.open(bundle_path, "r:gz") as tf:
+                tf.extractall(out_dir)
+        except Exception as e:
+            print(f"FAIL: could not extract bundle: {e}", file=sys.stderr)
+            return 2
+
+        manifest = out_dir / "run_manifest.json"
+        if not manifest.exists():
+            print("FAIL: bundle missing run_manifest.json", file=sys.stderr)
+            return 2
+
+        # Reuse cmd_verify_manifest but point manifest to extracted dir.
+        # Build a tiny argparse-like object with needed fields.
+        class _Args:
+            pass
+
+        va = _Args()
+        va.manifest = str(manifest)
+        va.trust = args.trust
+        va.pubkey = getattr(args, "pubkey", None)
+        va.require_finalized = bool(getattr(args, "require_finalized", False))
+        va.enforce_policy = bool(getattr(args, "enforce_policy", False))
+
+        # policy-path:
+        # - if user supplied, use it (recompute sha256 against that file)
+        # - else if bundle contains policy.json, use that
+        if getattr(args, "policy_path", None):
+            va.policy_path = args.policy_path
+        else:
+            bundled_policy = out_dir / "policy.json"
+            va.policy_path = str(bundled_policy) if bundled_policy.exists() else None
+
+        return cmd_verify_manifest(va)
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -268,13 +725,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     from cryptography.hazmat.primitives import serialization
     import uuid
 
-    out_dir = Path(args.out_dir)
+    # ---- env fallbacks (flags win) ----
+    out_dir_str = getattr(args, "out_dir", None) or os.environ.get("VACI_OUT_DIR") or ".vaci"
+    out_dir = Path(out_dir_str).expanduser()
+    if not out_dir.is_absolute():
+        out_dir = (Path.cwd() / out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     run_id = getattr(args, "run_id", None) or os.environ.get("VACI_RUN_ID") or uuid.uuid4().hex
     call_id = getattr(args, "call_id", None) or uuid.uuid4().hex
     policy_id = getattr(args, "policy_id", None) or os.environ.get("VACI_POLICY_ID") or "dev"
     policy_path = getattr(args, "policy_path", None) or os.environ.get("VACI_POLICY_PATH")
+
     try:
         policy_sha256 = _compute_policy_sha256(policy_path)
     except FileNotFoundError as e:
@@ -293,7 +755,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             _write_gateway_keyfile(ephem_keyfile, gw)
     else:
         try:
-            keyfile = getattr(args, "keyfile", ".vaci_keys/gateway_ed25519.key")
+            keyfile = (
+                getattr(args, "keyfile", None)
+                or os.environ.get("VACI_KEYFILE")
+                or ".vaci_keys/gateway_ed25519.key"
+            )
             gw = LocalGateway.from_keyfile(keyfile)
         except FileNotFoundError:
             print(f"FAIL: gateway keyfile not found: {keyfile}", file=sys.stderr)
@@ -479,11 +945,12 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     from vaci.crypto import hashref_sha256_from_obj, verify_obj_ed25519
     from vaci.schema import Signature
 
+    require_finalized = bool(getattr(args, "require_finalized", False))
     manifest_path = Path(args.manifest)
     mj = _read_json(manifest_path)
 
-    require_finalized = bool(getattr(args, "require_finalized", False))
-    policy_path = getattr(args, "policy_path", None) or os.environ.get("VACI_POLICY_PATH")
+    enforce_policy = bool(getattr(args, "enforce_policy", False))
+    policy_path = getattr(args, "policy_path", None)
     try:
         policy_sha256_expected = _compute_policy_sha256(policy_path) if policy_path else None
     except FileNotFoundError as e:
@@ -820,9 +1287,13 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
             print(f"FAIL: receipt verification failed for {rp}", file=sys.stderr)
             return 2
 
-        # ---- V2: if policy-path is supplied, enforce that denied receipts fail verification ----
-        if policy_sha256_expected is not None:
-            # receipt JSON may be V1 (no policy_decision); treat missing as "allow"
+        # ---- Strict mode: enforce policy decisions recorded in receipts ----
+        #
+        # Default behavior is crypto  integrity only.
+        # If --enforce-policy is set, fail on any denied receipt.
+        #
+        # NOTE: receipt JSON may be V1 (no policy_decision); treat missing as "allow".
+        if enforce_policy:
             decision = rj.get("policy_decision", "allow")
             if decision == "deny":
                 reason = rj.get("deny_reason") or "policy denied"
@@ -893,6 +1364,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print("OK: receipt verified", file=sys.stderr)
     return 0
 
+ 
+def cmd_presets(args: argparse.Namespace) -> int:
+    """
+    List built-in policy presets shipped with VACI.
+    """
+    for name in list_presets():
+        print(name)
+    return 0
+
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="vaci")
@@ -921,10 +1401,17 @@ def main(argv: list[str] | None = None) -> int:
     trust_add.set_defaults(fn=cmd_trust_add)
 
     runp = sp.add_parser("run", help="Run a command and emit signed receipt artifacts")
-    runp.add_argument("--out-dir", default=".vaci", help="Directory to write receipt artifacts")
+    runp.add_argument(
+        "--out-dir",
+        default=None,
+        help="Directory to write receipt artifacts (default: env VACI_OUT_DIR or .vaci)",
+    )
     runp.add_argument("--cwd", default=None, help="Working directory")
-    runp.add_argument("--keyfile", default=".vaci/gateway_ed25519.key", help="Gateway private keyfile")
-
+    runp.add_argument(
+        "--keyfile",
+        default=None,
+        help="Gateway private keyfile (default: env VACI_KEYFILE or .vaci_keys/gateway_ed25519.key)",
+    )
 
     runp.add_argument("--ephemeral", action="store_true", help="Use ephemeral key (dev/tests)")
 
@@ -932,8 +1419,8 @@ def main(argv: list[str] | None = None) -> int:
     runp.add_argument("--run-id", default=None, help="Run id (default: auto-generated)")
     runp.add_argument(
         "--policy-id",
-        default=os.environ.get("VACI_POLICY_ID"),
-        help="Policy id (default: env VACI_POLICY_ID)",
+        default=None,
+        help="Policy id (default: env VACI_POLICY_ID or 'dev')",
     )
     runp.add_argument("--call-id", default=None, help="Call id (default: auto-generated per invocation)")
     runp.add_argument("--policy-path", default=None, help="Path to policy file; binds sha256 into receipts+manifest")
@@ -970,7 +1457,82 @@ def main(argv: list[str] | None = None) -> int:
     mp.add_argument("--pubkey", default=None, help="Optional override pubkey file (otherwise uses manifest receipts[0])")
     mp.add_argument("--require-finalized", action="store_true", help="Fail unless manifest finalized=true")
     mp.add_argument("--policy-path", default=None, help="Policy file path; recompute sha256 and compare to manifest")
+    mp.add_argument(
+        "--enforce-policy",
+        action="store_true",
+        help="Strict mode: fail verification if any receipt has policy_decision=deny (default: cryptohashes only)",
+    )
     mp.set_defaults(fn=cmd_verify_manifest)
+
+    pp = sp.add_parser("presets", help="List built-in policy presets shipped with VACI")
+    
+    pp.set_defaults(fn=cmd_presets)
+
+    initp = sp.add_parser("init", help="Initialize a repo-local policy from a built-in preset")
+    initp.add_argument(
+        "--preset",
+        required=True,
+        help="Preset name (see: vaci presets)",
+    )
+    initp.add_argument(
+        "--out",
+        default="policy/policy.json",
+        help="Where to write the policy file (default: policy/policy.json)",
+    )
+    initp.add_argument("--force", action="store_true", help="Overwrite policy file if it already exists")
+    initp.add_argument("--gitignore", action="store_true", help='Add ".vaci/" to .gitignore (idempotent)')
+    initp.add_argument("--gitignore-path", default=".gitignore", help="Path to .gitignore (default: .gitignore)")
+    initp.set_defaults(fn=cmd_init)
+
+    demop = sp.add_parser("demo", help="Run an end-to-end demo (allow  deny  finalize  verify)")
+    demop.add_argument(
+        "--preset",
+        required=True,
+        help="Preset name (see: vaci presets)",
+    )
+    demop.add_argument(
+        "--out-dir",
+        default=None,
+        help="Optional output directory (default: .vaci/demo_runs/<run_id>/)",
+    )
+    demop.add_argument("--run-id", default=None, help="Optional explicit run id (default: derived from out dir name)")
+    demop.add_argument(
+        "--policy-path",
+        default=None,
+        help="Optional policy file path (default: writes preset policy into demo dir)",
+    )
+    demop.add_argument("--verbose", action="store_true", help="Print subcommands as they run")
+    demop.set_defaults(fn=cmd_demo)
+
+    sessp = sp.add_parser("session", help="Create a VACI session dir and print env exports")
+    sessp.add_argument("--preset", required=True, help="Preset name (see: vaci presets)")
+    sessp.add_argument("--run-id", default=None, help="Optional explicit run id (default: auto-generated)")
+    sessp.add_argument("--base-dir", default=None, help="Base sessions dir (default: .vaci/sessions)")
+    sessp.add_argument("--print-hint", action="store_true", help="Print usage hint to stderr")
+    sessp.set_defaults(fn=cmd_session)
+
+    bp = sp.add_parser("bundle", help="Create a portable .tgz bundle for a run_manifest  artifacts")
+    bp.add_argument("--manifest", default=".vaci/run_manifest.json", help="Path to run_manifest.json")
+    bp.add_argument("--out", required=True, help="Output bundle path (e.g., run_bundle.tgz)")
+    bp.add_argument("--policy-path", default=None, help="Optional policy file to include as policy.json in the bundle")
+    bp.set_defaults(fn=cmd_bundle)
+
+    vbp = sp.add_parser("verify-bundle", help="Verify a portable bundle (.tgz)")
+    vbp.add_argument("--bundle", required=True, help="Bundle path (.tgz)")
+    vbp.add_argument(
+        "--trust",
+        default=".vaci/trusted_keys.json",
+        help="Path to trusted signer key allowlist",
+    )
+    vbp.add_argument("--pubkey", default=None, help="Optional override pubkey file (otherwise uses receipts[0])")
+    vbp.add_argument("--require-finalized", action="store_true", help="Fail unless manifest finalized=true")
+    vbp.add_argument("--policy-path", default=None, help="Optional policy file path to bind/check against bundle manifest")
+    vbp.add_argument(
+        "--enforce-policy",
+        action="store_true",
+        help="Fail if any receipt has policy_decision=deny (default: cryptohashes only)",
+    )
+    vbp.set_defaults(fn=cmd_verify_bundle)
 
     args = ap.parse_args(argv)
 

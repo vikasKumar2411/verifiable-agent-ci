@@ -2,12 +2,30 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 
-def _run(cmd: list[str], cwd: Path):
-    return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+def _clean_env() -> dict:
+    """
+    Avoid test flakiness from user shell env (especially VACI_POLICY_PATH / session vars).
+    """
+    env = os.environ.copy()
+    for k in [
+        "VACI_POLICY_PATH",
+        "VACI_OUT_DIR",
+        "VACI_KEYFILE",
+        "VACI_POLICY_ID",
+        "VACI_RUN_ID",
+        "VACI_TRUST",
+    ]:
+        env.pop(k, None)
+    return env
+
+
+def _run(cmd: list[str], cwd: Path, env: dict):
+    return subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=env)
 
 
 def _cli():
@@ -15,16 +33,19 @@ def _cli():
 
 
 def test_policy_denies_and_emits_signed_denial_receipt(tmp_path: Path):
+    env = _clean_env()
     root = Path.cwd()
+
     out = tmp_path / ".vaci"
     out.mkdir(parents=True, exist_ok=True)
 
+    # Allow only echo; deny everything else (e.g. ls)
     policy = tmp_path / "policy.json"
     policy.write_text(json.dumps({"version": 1, "allow": ["echo"]}))
 
     # Create gateway key
     keyfile = tmp_path / "gw.key"
-    p = _run(_cli() + ["keygen", "--out", str(keyfile)], cwd=root)
+    p = _run(_cli() + ["keygen", "--out", str(keyfile)], cwd=root, env=env)
     assert p.returncode == 0, (p.stdout or "") + (p.stderr or "")
 
     run_id = "run_policy_1"
@@ -49,6 +70,7 @@ def test_policy_denies_and_emits_signed_denial_receipt(tmp_path: Path):
             "ok",
         ],
         cwd=root,
+        env=env,
     )
     assert p.returncode == 0, (p.stdout or "") + (p.stderr or "")
 
@@ -71,16 +93,21 @@ def test_policy_denies_and_emits_signed_denial_receipt(tmp_path: Path):
             "ls",
         ],
         cwd=root,
+        env=env,
     )
     assert p.returncode == 0, (p.stdout or "") + (p.stderr or "")
 
     # Trust key
     trust = tmp_path / "trusted_keys.json"
     trust.write_text(json.dumps({"trusted_key_ids": []}))
-    p = _run(_cli() + ["trust", "add", "--pubkey", str(out / "public_key_b64.json"), "--trust", str(trust)], cwd=root)
-    assert p.returncode == 0
+    p = _run(
+        _cli() + ["trust", "add", "--pubkey", str(out / "public_key_b64.json"), "--trust", str(trust)],
+        cwd=root,
+        env=env,
+    )
+    assert p.returncode == 0, (p.stdout or "") + (p.stderr or "")
 
-    # verify-manifest should FAIL because there is a denied receipt and policy-path is supplied
+    # Default verify should PASS (crypto + hashes only)
     p = _run(
         _cli()
         + [
@@ -89,12 +116,31 @@ def test_policy_denies_and_emits_signed_denial_receipt(tmp_path: Path):
             str(out / "run_manifest.json"),
             "--trust",
             str(trust),
-            "--policy-path",
-            str(policy),
+            # IMPORTANT: do NOT pass --policy-path here unless you intend to enforce binding.
+            # Even if you pass it, current implementation still won't fail on deny unless --enforce-policy is set.
         ],
         cwd=root,
+        env=env,
     )
-    assert p.returncode == 2, (p.stdout or "") + (p.stderr or "")
+    assert p.returncode == 0, (p.stdout or "") + (p.stderr or "")
+
+    # Strict verify should FAIL because there is a denied receipt
+    p = _run(
+        _cli()
+        + [
+            "verify-manifest",
+            "--manifest",
+            str(out / "run_manifest.json"),
+            "--trust",
+            str(trust),
+            "--enforce-policy",
+        ],
+        cwd=root,
+        env=env,
+    )
+    assert p.returncode != 0, "Expected enforce-policy to fail when denied receipt exists"
+    combined = (p.stdout + p.stderr).lower()
+    assert ("deny" in combined) or ("denied" in combined), combined
 
     # sanity: inspect denial receipt exists and is marked deny
     mj = json.loads((out / "run_manifest.json").read_text())

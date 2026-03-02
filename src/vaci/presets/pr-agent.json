@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "allow": [
+    "git",
+    "node",
+    "npm",
+    "npx",
+    "bash",
+    "sh",
+    "python",
+    "pytest",
+    "jest",
+    "echo"
+  ],
+  "deny": [
+    "curl",
+    "wget"
+  ],
+  "deny_shell": false,
+  "deny_arg_globs": [".git/**", ".env", "**/*.pem", "**/*id_rsa*"]
+}
