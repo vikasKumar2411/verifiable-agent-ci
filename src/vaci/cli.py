@@ -13,6 +13,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 from typing import Any, Dict
 
 from vaci.trust import TrustError, assert_trusted_signer, key_id_from_receipt_json
@@ -201,7 +202,7 @@ def _ensure_gitignore_has_vaci(gitignore_path: Path) -> None:
 
 def _safe_timestamp() -> str:
     # filesystem-friendly timestamp
-    return datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 def _choose_demo_dir(base: str = ".vaci/demo_runs") -> Path:
     base_dir = Path(base).expanduser()
@@ -1389,8 +1390,18 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
     pubkey = pubkey_raw
 
     signer_key_id = hashlib.sha256(pubkey_raw).hexdigest()
-    # Bind "manifest signer" pubkey file hash so we can enforce signer-consistency across entries
-    signer_pubkey_file_sha256 = _sha256_file(pubkey_path)
+
+    def _key_id_from_pubkey_file(p: Path) -> str:
+        """
+        Compute the stable signer identity from a pubkey JSON file:
+          key_id = sha256(pubkey_raw).hexdigest()
+        """
+        pjx = _read_json(p)
+        pb = pjx.get("pubkey_b64")
+        if not isinstance(pb, str) or not pb:
+            raise ValueError(f"pubkey file must contain pubkey_b64: {p}")
+        raw = _b64.urlsafe_b64decode(pb + "==")
+        return hashlib.sha256(raw).hexdigest()
 
     # -------- Variant-B only (manifest_hash MUST be Variant-B) --------
     payload_b = dict(mj)
@@ -1507,19 +1518,29 @@ def cmd_verify_manifest(args: argparse.Namespace) -> int:
             return 2
         prev_ts = ts
 
-        # signer consistency: require each entry binds the same pubkey_sha256 as manifest signer pubkey file
-        psha = e.get("pubkey_sha256")
-        if not isinstance(psha, str) or not psha:
-            print(f"FAIL: receipts[{i}] missing pubkey_sha256", file=sys.stderr)
+        # signer consistency (correct): enforce same signing KEY across entries (not same JSON file bytes).
+        # Each entry may point to a different pubkey_<call_id>.json, but they must decode to the same key_id.
+        try:
+            entry_pubkey_path = _abs_from_manifest(e.get("pubkey_path", ""))
+        except Exception:
+            print(f"FAIL: receipts[{i}] missing pubkey_path", file=sys.stderr)
             return 2
-        if psha != signer_pubkey_file_sha256:
-            print("FAIL: mixed-signer manifest (pubkey_sha256 mismatch vs signer pubkey)", file=sys.stderr)
+        if not entry_pubkey_path.exists():
+            print(f"FAIL: receipts[{i}] pubkey file missing: {entry_pubkey_path}", file=sys.stderr)
+            return 2
+        try:
+            entry_key_id = _key_id_from_pubkey_file(entry_pubkey_path)
+        except Exception as ex:
+            print(f"FAIL: receipts[{i}] invalid pubkey file: {entry_pubkey_path}", file=sys.stderr)
+            print(f"  error: {ex}", file=sys.stderr)
+            return 2
+        if entry_key_id != signer_key_id:
+            print("FAIL: mixed-signer manifest (entry pubkey key_id != manifest signer key_id)", file=sys.stderr)
             print(f"  index:   {i}", file=sys.stderr)
             print(f"  call_id: {cid}", file=sys.stderr)
-            print(f"  expected pubkey_sha256: {signer_pubkey_file_sha256}", file=sys.stderr)
-            print(f"  got      pubkey_sha256: {psha}", file=sys.stderr)
+            print(f"  expected signer_key_id: {signer_key_id}", file=sys.stderr)
+            print(f"  got      entry_key_id:  {entry_key_id}", file=sys.stderr)
             return 2
-
 
     # -------- verify receipt entry chain (reorder/delete detection) --------
     prev = None
